@@ -1,7 +1,9 @@
 """
-Telegram Audio Batch Bot
-Hugging Face Spaces - Free Tier
-Polling mode (no webhook needed)
+Telegram Audio Batch Bot — Render deployment
+Webhook mode: Telegram -> Render directly (no relay needed for inbound).
+Outbound (bot -> Telegram): tries api.telegram.org directly first.
+If TELEGRAM_API_BASE_URL is set, routes through that Worker instead
+(only needed if Render blocks outbound to api.telegram.org).
 """
 
 import asyncio
@@ -9,14 +11,14 @@ import logging
 import os
 import json
 import re
+import time
 from datetime import datetime, timedelta
 
-# Local development: load .env file if present
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # On HF Spaces dotenv not needed
+    pass
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -33,9 +35,7 @@ logging.basicConfig(
     level=logging.ERROR
 )
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)  # our own bot's status/info lines stay visible
-                                # even though library noise (httpx, apscheduler,
-                                # telegram.ext) is silenced above at ERROR.
+logger.setLevel(logging.INFO)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
@@ -44,25 +44,36 @@ BOT_USERNAME   = os.environ["BOT_USERNAME"].strip().lstrip("@")
 DATABASE_URL   = os.environ["DATABASE_URL"]
 BATCH_MAX      = 50
 DELETE_MINUTES = 5
-# CHANNEL_ID removed — every batch now belongs to a folder, and every folder
-# carries its own channel_id. There is no single default channel anymore.
+
+# Render ka apna public HTTPS URL — Telegram seedha yahan POST karta hai.
+# Format: https://your-service.onrender.com/webhook
+WEBHOOK_URL = os.environ["WEBHOOK_URL"].strip()
+
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"].strip()
+
+# Render inject karta hai PORT khud — default 7860 sirf local ke liye.
+PORT = int(os.environ.get("PORT", "7860"))
+
+# Optional — sirf tab set karo jab Render outbound api.telegram.org block kare.
+# Agar unset hai, bot seedha api.telegram.org se baat karta hai (preferred).
+# Agar set hai, har outbound call is Worker URL se route hoga.
+TELEGRAM_API_BASE_URL = os.environ.get("TELEGRAM_API_BASE_URL", "").strip()
+
+# "render" (default) = download_from_drive kabhi nahi chalega.
+# "local"            = local_sync.py mode, Drive se download + file_id cache.
+RUN_ENV = os.environ.get("RUN_ENV", "render").strip().lower()
 
 db = Database(DATABASE_URL)
 
-# ── In-memory owner state machine (single owner, sequential flows only) ──────
-# Only one of these is ever active at a time. Each represents "the bot is
-# waiting for the owner's next text message to mean something specific."
-upload_session: list | None = None       # collecting drive links
-pending_links: list | None = None        # links collected, waiting on batch name
-selected_folder_id: int | None = None    # folder chosen for the current upload
-
-awaiting_new_folder_name: bool = False             # waiting for new folder's name
-awaiting_channel_id_for_folder: int | None = None  # folder id waiting for a channel_id
+# ── In-memory owner state machine ────────────────────────────────────────────
+upload_session: list | None = None
+pending_links: list | None = None
+selected_folder_id: int | None = None
+awaiting_new_folder_name: bool = False
+awaiting_channel_id_for_folder: int | None = None
 
 
 def _reset_owner_state():
-    """Clear all in-progress owner flows. Used when starting a new flow so
-    stray state from an abandoned previous flow can't bleed into it."""
     global upload_session, pending_links, selected_folder_id
     global awaiting_new_folder_name, awaiting_channel_id_for_folder
     upload_session = None
@@ -72,7 +83,7 @@ def _reset_owner_state():
     awaiting_channel_id_for_folder = None
 
 
-# ── /folders — manage folders (list / create / update channel) ───────────────
+# ── /folders ──────────────────────────────────────────────────────────────────
 async def cmd_folders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
@@ -145,12 +156,11 @@ async def cb_folder_setchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     awaiting_channel_id_for_folder = folder_id
     await update.callback_query.edit_message_text(
         "📡 Channel ID bhejein (e.g. @channelusername ya -100xxxxxxxxxx).\n\n"
-        "⚠️ Bot ko us channel mein admin banana zaroori hai (Post Messages permission ke saath), "
-        "warna posting fail hogi."
+        "⚠️ Bot ko us channel mein admin banana zaroori hai (Post Messages permission ke saath)."
     )
 
 
-# ── /startupload — pick folder, then collect links ────────────────────────────
+# ── /startupload ──────────────────────────────────────────────────────────────
 async def cmd_startupload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
@@ -199,11 +209,6 @@ async def cb_upload_folder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _repost_all_batches_for_folder(folder_id, new_channel_id, update, ctx):
-    """Repost every batch belonging to this folder into its new channel.
-    Used when a folder's channel_id is changed — old posts stay in the old
-    channel forever (Telegram has no "move message" operation), so this
-    creates fresh posts in the new channel instead and updates each batch's
-    channel_message_id to point at the new post."""
     batches = await db.fetch(
         "SELECT id, name, total_links FROM batches WHERE folder_id = $1 ORDER BY id",
         folder_id
@@ -216,7 +221,7 @@ async def _repost_all_batches_for_folder(folder_id, new_channel_id, update, ctx)
         f"🔁 {len(batches)} batches naye channel mein repost ho rahe hain... isme time lagega."
     )
 
-    REPOST_DELAY = 2  # seconds between posts — stays well under Telegram's rate limit
+    REPOST_DELAY = 2
     success_count = 0
     failed_ids = []
 
@@ -242,14 +247,13 @@ async def _repost_all_batches_for_folder(folder_id, new_channel_id, update, ctx)
     await update.message.reply_text(summary)
 
 
-# ── Collect links / handle text replies for the active flow ──────────────────
+# ── Text message handler ──────────────────────────────────────────────────────
 async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
 
     text = (update.message.text or "").strip()
 
-    # State: waiting for a new folder's name
     global awaiting_new_folder_name
     if awaiting_new_folder_name:
         if not text:
@@ -275,25 +279,22 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # State: waiting for a channel_id (new folder, or updating an existing one)
     if awaiting_channel_id_for_folder is not None:
         if not text:
             await update.message.reply_text("⚠️ Channel ID khali nahi ho sakta.")
             return
         folder_id = awaiting_channel_id_for_folder
-        awaiting_channel_id_for_folder = None
 
         folder_before = await db.fetchrow("SELECT channel_id FROM folders WHERE id = $1", folder_id)
         had_previous_channel = bool(folder_before and folder_before["channel_id"])
 
-        # Verify the bot can actually post here before saving — catches a
-        # wrong ID or missing admin rights immediately instead of failing
-        # silently on the first real batch later.
         try:
             await ctx.bot.send_message(chat_id=text, text="✅ Channel linked successfully.")
             await db.execute("UPDATE folders SET channel_id = $1 WHERE id = $2", text, folder_id)
+            awaiting_channel_id_for_folder = None
             await update.message.reply_text("✅ Channel ID save ho gaya aur verify ho gaya.")
         except Exception as e:
+            awaiting_channel_id_for_folder = None
             logger.error(f"Channel verify failed for folder {folder_id}: {e}")
             await update.message.reply_text(
                 f"❌ Channel ID save nahi hua — bot wahan post nahi kar saka.\n"
@@ -302,14 +303,10 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Channel was UPDATED (not set for the first time) — repost every
-        # batch this folder already has into the new channel, since the
-        # old posts live in the old channel and don't move on their own.
         if had_previous_channel:
             await _repost_all_batches_for_folder(folder_id, text, update, ctx)
         return
 
-    # State: waiting for batch name
     global pending_links
     if pending_links is not None:
         if not text:
@@ -321,8 +318,11 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await process_links(links, text, selected_folder_id, update, ctx)
         return
 
-    # State: collecting drive links
     if upload_session is None:
+        await update.message.reply_text(
+            "ℹ️ Koi active session nahi hai.\n\n"
+            "/startupload se naya upload shuru karein, ya /folders se folders manage karein."
+        )
         return
 
     links = re.findall(r'https://drive\.google\.com/\S+', update.message.text or "")
@@ -364,9 +364,6 @@ async def process_links(links, name, folder_id, update, ctx):
 
     remaining = list(links)
 
-    # Fill existing incomplete batch first, but only within the SAME folder —
-    # filling a Hindi-folder batch with Punjabi links would be wrong, so the
-    # "most recent incomplete batch" search is now scoped per folder.
     existing = await db.fetchrow(
         "SELECT id, total_links, name, channel_message_id FROM batches "
         "WHERE folder_id = $1 AND total_links < $2 ORDER BY created_at DESC LIMIT 1",
@@ -381,10 +378,7 @@ async def process_links(links, name, folder_id, update, ctx):
 
         batch_name = existing["name"] or name
         if not existing["name"]:
-            await db.execute(
-                "UPDATE batches SET name = $1 WHERE id = $2",
-                batch_name, existing["id"]
-            )
+            await db.execute("UPDATE batches SET name = $1 WHERE id = $2", batch_name, existing["id"])
 
         for link in to_fill:
             await db.execute(
@@ -406,23 +400,17 @@ async def process_links(links, name, folder_id, update, ctx):
         if edited:
             note = "Channel post update hua."
         else:
-            # Edit failed — most likely the folder's channel_id changed since
-            # this batch was originally posted, so the old message_id belongs
-            # to a different chat than channel_id now points to. Don't leave
-            # the batch silently unposted in the current channel — post fresh.
             new_msg_id = await post_to_channel(existing["id"], new_total, batch_name, channel_id, ctx)
             await db.execute(
                 "UPDATE batches SET channel_message_id = $1 WHERE id = $2",
                 str(new_msg_id), existing["id"]
             )
-            note = "⚠️ Purana channel post edit nahi ho saka (channel badal gaya tha) — naya post is channel mein bheja gaya."
+            note = "⚠️ Purana channel post edit nahi ho saka — naya post bheja gaya."
 
         await update.message.reply_text(
-            f"📥 Batch #{existing['id']} mein {len(to_fill)} audios fill hue (ab total {new_total}).\n"
-            f"{note}"
+            f"📥 Batch #{existing['id']} mein {len(to_fill)} audios fill hue (ab total {new_total}).\n{note}"
         )
 
-    # New batches for remaining — split into chunks if remaining > BATCH_MAX
     chunks = [remaining[i:i + BATCH_MAX] for i in range(0, len(remaining), BATCH_MAX)]
     multi = len(chunks) > 1
 
@@ -463,8 +451,6 @@ def _channel_text(name, total) -> str:
 
 def _channel_button(batch_id, name) -> InlineKeyboardMarkup:
     display_name = name or "Audios"
-    # Telegram inline buttons render badly past ~40-50 chars on mobile —
-    # truncate so the button stays one clean line instead of wrapping/clipping.
     label_name = display_name if len(display_name) <= 40 else display_name[:37] + "..."
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(
@@ -484,8 +470,6 @@ async def post_to_channel(batch_id, total, name, channel_id, ctx) -> int:
 
 
 async def edit_channel_post(batch_id, name, total, channel_message_id, channel_id, ctx) -> bool:
-    """Edit the existing channel post in place (text + button) instead of posting new.
-    Returns False if the edit fails (e.g. message too old, deleted, or id missing)."""
     try:
         await ctx.bot.edit_message_text(
             chat_id=channel_id,
@@ -499,11 +483,10 @@ async def edit_channel_post(batch_id, name, total, channel_message_id, channel_i
         return False
 
 
-# ── /start batch_N (user flow) ────────────────────────────────────────────────
+# ── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
 
-    # Owner ka plain /start — control panel dikhao
     if update.effective_user.id == OWNER_ID:
         if not args or not args[0].startswith("batch_"):
             await update.message.reply_text(
@@ -517,7 +500,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # Normal user bina batch arg ke
     if not args or not args[0].startswith("batch_"):
         await update.message.reply_text("👋 Is bot ko channel ke through use karein.")
         return
@@ -526,9 +508,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id  = update.effective_chat.id
     user_id  = str(update.effective_user.id)
 
-    batch = await db.fetchrow(
-        "SELECT id, total_links FROM batches WHERE id = $1", batch_id
-    )
+    batch = await db.fetchrow("SELECT id, total_links FROM batches WHERE id = $1", batch_id)
     if not batch:
         await update.message.reply_text("❌ Yeh collection exist nahi karta.")
         return
@@ -541,19 +521,25 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     audios = await db.fetch(
-        "SELECT id, drive_link, telegram_file_id FROM audios WHERE batch_id = $1",
-        batch_id
+        "SELECT id, drive_link, telegram_file_id FROM audios WHERE batch_id = $1", batch_id
     )
-    # Send cached (telegram_file_id already known) audios first — these are
-    # instant since they skip Drive entirely. Uncached ones (needing a Drive
-    # download) go after, so the user isn't stuck waiting on the slowest
-    # item before getting anything.
     audios = sorted(audios, key=lambda a: a["telegram_file_id"] is None)
 
+    has_uncached = any(a["telegram_file_id"] is None for a in audios)
     sent_ids = [warn.message_id]
+
+    if has_uncached and RUN_ENV == "local":
+        delay_notice = await update.message.reply_text(
+            "⏳ Kuch audios pehli baar download ho rahe hain, isme *2 minute tak* lag sakte hain. "
+            "Cached audios turant aa jayenge.",
+            parse_mode="Markdown"
+        )
+        sent_ids.append(delay_notice.message_id)
+
     failed_audios = []
-    MAX_ATTEMPTS = 3  # 1 initial + 2 retries
-    RETRY_DELAY = 3  # seconds
+    uncached_missing = []
+    MAX_ATTEMPTS = 3
+    RETRY_DELAY = 3
 
     for audio in audios:
         msg = None
@@ -564,9 +550,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 if audio["telegram_file_id"]:
                     msg = await ctx.bot.send_audio(chat_id=chat_id, audio=audio["telegram_file_id"])
-                else:
-                    # Download once, reuse the bytes across retries — no point
-                    # re-hitting Drive if only the Telegram upload failed.
+                elif RUN_ENV == "local":
                     if file_bytes is None:
                         file_bytes, filename = await download_from_drive(audio["drive_link"])
                     msg = await ctx.bot.send_audio(chat_id=chat_id, audio=file_bytes, filename=filename)
@@ -575,7 +559,15 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                             "UPDATE audios SET telegram_file_id = $1 WHERE id = $2",
                             msg.audio.file_id, audio["id"]
                         )
-                break  # success
+                else:
+                    # Render mode: Drive download allowed nahi.
+                    # local_sync.py se pehle sync karo.
+                    logger.warning(
+                        f"Audio {audio['id']} has no telegram_file_id and "
+                        f"RUN_ENV={RUN_ENV} — skipping live download."
+                    )
+                    msg = None
+                break
             except Exception as e:
                 logger.error(f"Audio {audio['id']} attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
                 if attempt < MAX_ATTEMPTS:
@@ -585,10 +577,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sent_ids.append(msg.message_id)
         else:
             failed_audios.append(audio["id"])
+            if RUN_ENV != "local" and audio["telegram_file_id"] is None:
+                uncached_missing.append(audio["id"])
 
-    if failed_audios:
+    if uncached_missing:
+        ids_str = ", ".join(f"#{i}" for i in uncached_missing)
         await update.message.reply_text(
-            f"⚠️ {len(failed_audios)}/{len(audios)} audio bhejne mein fail hue "
+            f"⚠️ Ye audios abhi sync nahi hue, local_sync.py se process karo pehle: {ids_str}"
+        )
+
+    other_failures = len(failed_audios) - len(uncached_missing)
+    if other_failures > 0:
+        await update.message.reply_text(
+            f"⚠️ {other_failures}/{len(audios)} audio bhejne mein fail hue "
             f"({MAX_ATTEMPTS} attempts ke baad bhi). Phir se /start try karein."
         )
 
@@ -608,7 +609,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── Auto-delete job (runs every 30s via JobQueue) ─────────────────────────────
+# ── Auto-delete job ───────────────────────────────────────────────────────────
 async def auto_delete_job(ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow()
     rows = await db.fetch(
@@ -625,25 +626,27 @@ async def auto_delete_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def post_init(application: Application):
-    """Runs inside PTB's own event loop — safe place to connect DB."""
     await db.connect()
     await db.init_schema()
     logger.info("Database connected and schema ready.")
 
+    try:
+        await application.bot.send_message(
+            chat_id=OWNER_ID,
+            text="🔄 Bot restart hua. Agar koi upload session active tha, woh reset ho gaya hai — /startupload se phir shuru karein."
+        )
+    except Exception as e:
+        logger.error(f"Restart notice to owner failed: {e}")
+
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-    """Without this, PTB dumps a full traceback for every transient network
-    blip (e.g. httpcore.ReadError on get_updates) — normal on long-polling
-    over a home internet connection, not a bot bug. PTB's own retry loop
-    already handles reconnecting; this just keeps the log readable."""
     logger.error(f"Unhandled error: {ctx.error}")
 
 
 def main():
-    # Default PTB request timeouts (read ~5s, write ~5s) are far too short for
-    # uploading large audio files. This is the actual cause of repeated
-    # "Timed out" errors after the Drive download already succeeded —
-    # those errors were happening on the send_audio leg, not the download.
+    new_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(new_loop)
+
     request = HTTPXRequest(
         connect_timeout=30.0,
         read_timeout=120.0,
@@ -651,13 +654,22 @@ def main():
         pool_timeout=30.0,
     )
 
-    app = (
+    builder = (
         Application.builder()
         .token(BOT_TOKEN)
         .request(request)
-        .post_init(post_init)   # DB connect here, inside PTB's loop
-        .build()
+        .post_init(post_init)
     )
+
+    # TELEGRAM_API_BASE_URL sirf tab set karo jab Render outbound block kare.
+    # Unset = seedha api.telegram.org (preferred, simpler).
+    if TELEGRAM_API_BASE_URL:
+        builder = builder.base_url(TELEGRAM_API_BASE_URL.rstrip("/") + "/bot")
+        logger.info(f"Outbound routed through Worker: {TELEGRAM_API_BASE_URL}")
+    else:
+        logger.info("Outbound: direct to api.telegram.org")
+
+    app = builder.build()
 
     app.add_handler(CommandHandler("startupload", cmd_startupload))
     app.add_handler(CommandHandler("done", cmd_done))
@@ -673,12 +685,18 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
     app.add_error_handler(on_error)
 
-    # Auto-delete every 30 seconds
     app.job_queue.run_repeating(auto_delete_job, interval=30, first=10)
 
-    logger.info("Bot polling started...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)  # plain call, NOT awaited
+    logger.info(f"Starting webhook server on 0.0.0.0:{PORT}, registering {WEBHOOK_URL}")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path="webhook",
+        webhook_url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
-    main()  # no asyncio.run()
+    main()
