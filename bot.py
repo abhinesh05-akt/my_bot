@@ -28,7 +28,6 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 from db import Database
-from drive import download_from_drive
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -36,6 +35,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# ── Live Drive download: file-presence gate ─────────────────────────────────
+# download_from_drive local_sync.py mein hai (standalone, kisi module par
+# depend nahi karta). Agar deploy karte waqt ye file bhi saath upload ki
+# gayi hai (Render ho ya local, farak nahi padta), import succeed hoga aur
+# live Drive download available hoga. Agar file hata di gayi hai deploy se
+# pehle, ImportError aayega aur feature khud-ba-khud band ho jayega —
+# uncached audios ke liye seedha "abhi available nahi hai" message jayega,
+# koi crash nahi.
+try:
+    from local_sync import download_from_drive
+    LIVE_DOWNLOAD_AVAILABLE = True
+except ImportError:
+    download_from_drive = None
+    LIVE_DOWNLOAD_AVAILABLE = False
+
+logger.info(
+    "Live Drive download: %s (local_sync.py %s)",
+    "ENABLED" if LIVE_DOWNLOAD_AVAILABLE else "DISABLED",
+    "found" if LIVE_DOWNLOAD_AVAILABLE else "missing"
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
@@ -58,10 +78,6 @@ PORT = int(os.environ.get("PORT", "7860"))
 # Agar unset hai, bot seedha api.telegram.org se baat karta hai (preferred).
 # Agar set hai, har outbound call is Worker URL se route hoga.
 TELEGRAM_API_BASE_URL = os.environ.get("TELEGRAM_API_BASE_URL", "").strip()
-
-# "render" (default) = download_from_drive kabhi nahi chalega.
-# "local"            = local_sync.py mode, Drive se download + file_id cache.
-RUN_ENV = os.environ.get("RUN_ENV", "render").strip().lower()
 
 db = Database(DATABASE_URL)
 
@@ -528,7 +544,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     has_uncached = any(a["telegram_file_id"] is None for a in audios)
     sent_ids = [warn.message_id]
 
-    if has_uncached and RUN_ENV == "local":
+    if has_uncached and LIVE_DOWNLOAD_AVAILABLE:
         delay_notice = await update.message.reply_text(
             "⏳ Kuch audios pehli baar download ho rahe hain, isme *2 minute tak* lag sakte hain. "
             "Cached audios turant aa jayenge.",
@@ -550,7 +566,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 if audio["telegram_file_id"]:
                     msg = await ctx.bot.send_audio(chat_id=chat_id, audio=audio["telegram_file_id"])
-                elif RUN_ENV == "local":
+                elif LIVE_DOWNLOAD_AVAILABLE:
                     if file_bytes is None:
                         file_bytes, filename = await download_from_drive(audio["drive_link"])
                     msg = await ctx.bot.send_audio(chat_id=chat_id, audio=file_bytes, filename=filename)
@@ -560,11 +576,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                             msg.audio.file_id, audio["id"]
                         )
                 else:
-                    # Render mode: Drive download allowed nahi.
-                    # local_sync.py se pehle sync karo.
+                    # local_sync.py deploy mein nahi hai — live download disabled.
                     logger.warning(
                         f"Audio {audio['id']} has no telegram_file_id and "
-                        f"RUN_ENV={RUN_ENV} — skipping live download."
+                        f"local_sync.py missing — skipping live download."
                     )
                     msg = None
                 break
@@ -577,14 +592,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sent_ids.append(msg.message_id)
         else:
             failed_audios.append(audio["id"])
-            if RUN_ENV != "local" and audio["telegram_file_id"] is None:
+            if not LIVE_DOWNLOAD_AVAILABLE and audio["telegram_file_id"] is None:
                 uncached_missing.append(audio["id"])
 
     if uncached_missing:
-        ids_str = ", ".join(f"#{i}" for i in uncached_missing)
-        await update.message.reply_text(
-            f"⚠️ Ye audios abhi sync nahi hue, local_sync.py se process karo pehle: {ids_str}"
-        )
+        await update.message.reply_text("⚠️ Ye audio abhi available nahi hai.")
 
     other_failures = len(failed_audios) - len(uncached_missing)
     if other_failures > 0:
