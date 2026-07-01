@@ -537,7 +537,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     audios = await db.fetch(
-        "SELECT id, drive_link, telegram_file_id FROM audios WHERE batch_id = $1", batch_id
+        "SELECT id, drive_link, telegram_file_id FROM audios WHERE batch_id = $1 ORDER BY id",
+        batch_id
     )
     audios = sorted(audios, key=lambda a: a["telegram_file_id"] is None)
 
