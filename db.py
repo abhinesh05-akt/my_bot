@@ -1,5 +1,6 @@
 import asyncpg
 import ssl
+import os
 
 
 class Database:
@@ -19,6 +20,17 @@ class Database:
         ssl_context = None
         if not is_local:
             ssl_context = ssl.create_default_context()
+            # Supabase's connection pooler (Supavisor) signs with Supabase's
+            # own CA, not one in the OS default trust store — that's why a
+            # plain create_default_context() rejects it as "self-signed".
+            # Fix is to add Supabase's real CA, not disable verification.
+            # Download prod-ca-2021.crt from: Supabase Dashboard -> Project
+            # Settings -> Database -> SSL Configuration, save it next to
+            # this file as supabase-ca.crt, commit it (it's a public CA
+            # cert, not a secret). Harmless no-op for Neon/other hosts.
+            supabase_ca_path = os.path.join(os.path.dirname(__file__), "supabase-ca.crt")
+            if os.path.exists(supabase_ca_path):
+                ssl_context.load_verify_locations(cafile=supabase_ca_path)
 
         self.pool = await asyncpg.create_pool(
             self.url,
