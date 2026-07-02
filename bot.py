@@ -224,42 +224,41 @@ async def cb_upload_folder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def _repost_all_batches_for_folder(folder_id, new_channel_id, update, ctx):
+async def _repost_all_pages_for_folder(folder_id, folder_name, new_channel_id, update, ctx):
     batches = await db.fetch(
-        "SELECT id, name, total_links FROM batches WHERE folder_id = $1 ORDER BY id",
+        "SELECT id, total_links FROM batches WHERE folder_id = $1 ORDER BY id",
         folder_id
     )
     if not batches:
         await update.message.reply_text("ℹ️ Is folder mein abhi koi batch nahi hai — repost karne ko kuch nahi.")
         return
 
+    total_pages = (len(batches) + PAGE_SIZE - 1) // PAGE_SIZE
     await update.message.reply_text(
-        f"🔁 {len(batches)} batches naye channel mein repost ho rahe hain... isme time lagega."
+        f"🔁 {total_pages} message(s) naye channel mein repost ho rahe hain... isme time lagega."
     )
 
     REPOST_DELAY = 2
     success_count = 0
-    failed_ids = []
+    failed_pages = []
 
-    for batch in batches:
+    for page_index in range(1, total_pages + 1):
         try:
-            msg_id = await post_to_channel(
-                batch["id"], batch["total_links"], batch["name"], new_channel_id, ctx
-            )
-            await db.execute(
-                "UPDATE batches SET channel_message_id = $1 WHERE id = $2",
-                str(msg_id), batch["id"]
+            # Naya channel = purana message_id wahan invalid hai, isliye
+            # force_new=True taaki edit try na ho, seedha naya message bhejein.
+            await render_folder_page(
+                folder_id, folder_name, new_channel_id, page_index, ctx, force_new=True
             )
             success_count += 1
         except Exception as e:
-            logger.error(f"Repost failed for batch {batch['id']}: {e}")
-            failed_ids.append(batch["id"])
+            logger.error(f"Repost failed for folder {folder_id} page {page_index}: {e}")
+            failed_pages.append(page_index)
 
         await asyncio.sleep(REPOST_DELAY)
 
-    summary = f"✅ {success_count}/{len(batches)} batches repost ho gaye naye channel mein."
-    if failed_ids:
-        summary += f"\n⚠️ Fail hue: batch #{', #'.join(str(i) for i in failed_ids)}"
+    summary = f"✅ {success_count}/{total_pages} messages repost ho gaye naye channel mein."
+    if failed_pages:
+        summary += f"\n⚠️ Fail hue: page #{', #'.join(str(i) for i in failed_pages)}"
     await update.message.reply_text(summary)
 
 
@@ -320,7 +319,8 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         if had_previous_channel:
-            await _repost_all_batches_for_folder(folder_id, text, update, ctx)
+            folder_row = await db.fetchrow("SELECT name FROM folders WHERE id = $1", folder_id)
+            await _repost_all_pages_for_folder(folder_id, folder_row["name"], text, update, ctx)
         return
 
     global pending_links
@@ -381,7 +381,7 @@ async def process_links(links, name, folder_id, update, ctx):
     remaining = list(links)
 
     existing = await db.fetchrow(
-        "SELECT id, total_links, name, channel_message_id FROM batches "
+        "SELECT id, total_links, name FROM batches "
         "WHERE folder_id = $1 AND total_links < $2 ORDER BY created_at DESC LIMIT 1",
         folder_id, BATCH_MAX
     )
@@ -406,22 +406,13 @@ async def process_links(links, name, folder_id, update, ctx):
             len(to_fill), existing["id"]
         )
 
-        edited = False
-        if existing["channel_message_id"]:
-            edited = await edit_channel_post(
-                existing["id"], batch_name, new_total,
-                existing["channel_message_id"], channel_id, ctx
-            )
-
-        if edited:
+        try:
+            page_index = await _page_index_for_batch(folder_id, existing["id"])
+            await render_folder_page(folder_id, folder["name"], channel_id, page_index, ctx)
             note = "Channel post update hua."
-        else:
-            new_msg_id = await post_to_channel(existing["id"], new_total, batch_name, channel_id, ctx)
-            await db.execute(
-                "UPDATE batches SET channel_message_id = $1 WHERE id = $2",
-                str(new_msg_id), existing["id"]
-            )
-            note = "⚠️ Purana channel post edit nahi ho saka — naya post bheja gaya."
+        except Exception as e:
+            logger.error(f"Channel page render failed for folder {folder_id}: {e}")
+            note = "⚠️ Channel post update nahi ho saka — audios DB mein save ho gaye hain, /folders se channel check karein."
 
         await update.message.reply_text(
             f"📥 Batch #{existing['id']} mein {len(to_fill)} audios fill hue (ab total {new_total}).\n{note}"
@@ -443,60 +434,108 @@ async def process_links(links, name, folder_id, update, ctx):
                 batch_id, link
             )
 
-        msg_id = await post_to_channel(batch_id, len(chunk), chunk_name, channel_id, ctx)
-        await db.execute(
-            "UPDATE batches SET channel_message_id = $1 WHERE id = $2",
-            str(msg_id), batch_id
-        )
+        try:
+            page_index = await _page_index_for_batch(folder_id, batch_id)
+            await render_folder_page(folder_id, folder["name"], channel_id, page_index, ctx)
+            note = f"\"{folder['name']}\" channel par post update ho gaya."
+        except Exception as e:
+            logger.error(f"Channel page render failed for folder {folder_id}: {e}")
+            note = "⚠️ Channel post update nahi ho saka — audios DB mein save ho gaye hain, /folders se channel check karein."
+
         await update.message.reply_text(
-            f"✅ Batch #{batch_id} \"{chunk_name}\" create hua ({len(chunk)} audios). "
-            f"\"{folder['name']}\" channel par post bheja gaya."
+            f"✅ Batch #{batch_id} \"{chunk_name}\" create hua ({len(chunk)} audios). {note}"
         )
 
     await update.message.reply_text("🎉 Upload complete!")
 
 
-def _channel_text(name, total) -> str:
-    display_name = name or "Audio Collection"
+PAGE_SIZE = 20  # ek channel message mein max itne inline buttons
+
+
+async def _page_index_for_batch(folder_id: int, batch_id: int) -> int:
+    """Folder ke andar is batch ki 1-based position se page number nikalta hai
+    (batches purane se naye order mein, id ke hisaab se)."""
+    position = await db.fetchval(
+        "SELECT COUNT(*) FROM batches WHERE folder_id = $1 AND id <= $2",
+        folder_id, batch_id
+    )
+    return ((position - 1) // PAGE_SIZE) + 1
+
+
+def _page_text(folder_name: str, page_index: int, total_pages: int, total_in_page: int) -> str:
+    display_name = folder_name or "Audio Collection"
+    part_suffix = f" (Part {page_index})" if total_pages > 1 else ""
     return (
-        f"🎵 {display_name}\n"
-        f"📦 Total Audios: {total}\n"
+        f"🎵 {display_name}{part_suffix}\n"
+        f"📦 Total Audios: {total_in_page}\n"
         f"👇 Niche button par click karke bot se audio prapt karein."
     )
 
 
-def _channel_button(batch_id, name) -> InlineKeyboardMarkup:
-    display_name = name or "Audios"
-    label_name = display_name if len(display_name) <= 40 else display_name[:37] + "..."
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            f"🎧 Get {label_name}",
-            url=f"https://t.me/{BOT_USERNAME}?start=batch_{batch_id}"
-        )
-    ]])
+def _page_buttons(batches_in_page: list, start_offset: int) -> InlineKeyboardMarkup:
+    rows = []
+    running = start_offset
+    for b in batches_in_page:
+        end = running + b["total_links"] - 1
+        label = f"{running}-{end}" if b["total_links"] > 1 else str(running)
+        rows.append([InlineKeyboardButton(label, url=f"https://t.me/{BOT_USERNAME}?start=batch_{b['id']}")])
+        running = end + 1
+    return InlineKeyboardMarkup(rows)
 
 
-async def post_to_channel(batch_id, total, name, channel_id, ctx) -> int:
-    msg = await ctx.bot.send_message(
-        chat_id=channel_id,
-        text=_channel_text(name, total),
-        reply_markup=_channel_button(batch_id, name)
+async def render_folder_page(folder_id: int, folder_name: str, channel_id: str, page_index: int, ctx,
+                              force_new: bool = False) -> None:
+    """Folder ke ek page (max 20 batches/buttons) ka channel message
+    (re)build karta hai. Agar page pehle se maujood hai to edit karta hai,
+    warna naya message bhejta hai. force_new=True (channel switch ke waqt)
+    mein hamesha naya message bhejta hai, purane channel ke message_id ko
+    edit karne ki koshish nahi karta."""
+    all_batches = await db.fetch(
+        "SELECT id, total_links FROM batches WHERE folder_id = $1 ORDER BY id",
+        folder_id
     )
-    return msg.message_id
+    total_pages = (len(all_batches) + PAGE_SIZE - 1) // PAGE_SIZE
+    if total_pages == 0 or page_index > total_pages:
+        return
 
+    start_slice = (page_index - 1) * PAGE_SIZE
+    end_slice = start_slice + PAGE_SIZE
+    batches_in_page = all_batches[start_slice:end_slice]
+    start_offset = sum(b["total_links"] for b in all_batches[:start_slice]) + 1
+    total_in_page = sum(b["total_links"] for b in batches_in_page)
 
-async def edit_channel_post(batch_id, name, total, channel_message_id, channel_id, ctx) -> bool:
-    try:
-        await ctx.bot.edit_message_text(
-            chat_id=channel_id,
-            message_id=int(channel_message_id),
-            text=_channel_text(name, total),
-            reply_markup=_channel_button(batch_id, name)
+    text = _page_text(folder_name, page_index, total_pages, total_in_page)
+    markup = _page_buttons(batches_in_page, start_offset)
+
+    page_row = await db.fetchrow(
+        "SELECT channel_message_id FROM folder_pages WHERE folder_id = $1 AND page_index = $2",
+        folder_id, page_index
+    )
+
+    edited = False
+    if page_row and page_row["channel_message_id"] and not force_new:
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=channel_id,
+                message_id=int(page_row["channel_message_id"]),
+                text=text,
+                reply_markup=markup
+            )
+            edited = True
+        except Exception as e:
+            logger.warning(f"Edit failed for folder {folder_id} page {page_index}, sending new: {e}")
+
+    if not edited:
+        msg = await ctx.bot.send_message(chat_id=channel_id, text=text, reply_markup=markup)
+        await db.execute(
+            """
+            INSERT INTO folder_pages (folder_id, page_index, channel_message_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (folder_id, page_index)
+            DO UPDATE SET channel_message_id = EXCLUDED.channel_message_id
+            """,
+            folder_id, page_index, str(msg.message_id)
         )
-        return True
-    except Exception as e:
-        logger.error(f"Failed to edit channel post for batch {batch_id}: {e}")
-        return False
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -566,11 +605,51 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 if audio["telegram_file_id"]:
-                    msg = await ctx.bot.send_audio(chat_id=chat_id, audio=audio["telegram_file_id"])
+                    try:
+                        msg = await ctx.bot.send_audio(chat_id=chat_id, audio=audio["telegram_file_id"])
+                    except Exception as e:
+                        logger.error(
+                            f"Audio {audio['id']} attempt {attempt}/{MAX_ATTEMPTS} "
+                            f"— CACHED SEND failed, clearing bad telegram_file_id: {e}"
+                        )
+                        await db.execute(
+                            "UPDATE audios SET telegram_file_id = NULL WHERE id = $1", audio["id"]
+                        )
+                        audio = dict(audio)
+                        audio["telegram_file_id"] = None
+                        if attempt < MAX_ATTEMPTS:
+                            await asyncio.sleep(RETRY_DELAY)
+                        continue
                 elif LIVE_DOWNLOAD_AVAILABLE:
                     if file_bytes is None:
-                        file_bytes, filename = await download_from_drive(audio["drive_link"])
-                    msg = await ctx.bot.send_audio(chat_id=chat_id, audio=file_bytes, filename=filename)
+                        try:
+                            file_bytes, filename = await download_from_drive(audio["drive_link"])
+                        except ValueError as e:
+                            # Permanent problem (bad/private/malformed link) — retrying won't
+                            # fix a broken URL, so fail this audio immediately.
+                            logger.error(
+                                f"Audio {audio['id']} — BAD DRIVE LINK, skipping retries: {e}"
+                            )
+                            msg = None
+                            break
+                        except Exception as e:
+                            logger.error(
+                                f"Audio {audio['id']} attempt {attempt}/{MAX_ATTEMPTS} "
+                                f"— DRIVE DOWNLOAD failed: {e}"
+                            )
+                            if attempt < MAX_ATTEMPTS:
+                                await asyncio.sleep(RETRY_DELAY)
+                            continue
+                    try:
+                        msg = await ctx.bot.send_audio(chat_id=chat_id, audio=file_bytes, filename=filename)
+                    except Exception as e:
+                        logger.error(
+                            f"Audio {audio['id']} attempt {attempt}/{MAX_ATTEMPTS} "
+                            f"— TELEGRAM UPLOAD failed: {e}"
+                        )
+                        if attempt < MAX_ATTEMPTS:
+                            await asyncio.sleep(RETRY_DELAY)
+                        continue
                     if msg.audio:
                         await db.execute(
                             "UPDATE audios SET telegram_file_id = $1 WHERE id = $2",
@@ -585,7 +664,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     msg = None
                 break
             except Exception as e:
-                logger.error(f"Audio {audio['id']} attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
+                logger.error(
+                    f"Audio {audio['id']} attempt {attempt}/{MAX_ATTEMPTS} "
+                    f"— UNEXPECTED failure: {e}"
+                )
                 if attempt < MAX_ATTEMPTS:
                     await asyncio.sleep(RETRY_DELAY)
 
