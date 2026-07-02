@@ -449,7 +449,10 @@ async def _repost_all_pages_for_folder(folder_id, folder_name, new_channel_id, u
 
 # ── Text message handler ──────────────────────────────────────────────────────
 async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"handle_links called: {update.message.text}")
+    logger.info(
+        f"handle_links: text={update.message.text}, "
+        f"force_step={awaiting_force_join_step}"
+    )
     if update.effective_user.id != OWNER_ID:
         return
 
