@@ -449,6 +449,7 @@ async def _repost_all_pages_for_folder(folder_id, folder_name, new_channel_id, u
 
 # ── Text message handler ──────────────────────────────────────────────────────
 async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"handle_links called: {update.message.text}")
     if update.effective_user.id != OWNER_ID:
         return
 
@@ -652,6 +653,9 @@ async def broadcast(update, context):
 
 
 async def handle_broadcast(update, context):
+    logger.info(
+        f"handle_broadcast called, mode={BROADCAST_MODE}, text={update.message.text}"
+    )
     global BROADCAST_MODE
 
     if not BROADCAST_MODE:
