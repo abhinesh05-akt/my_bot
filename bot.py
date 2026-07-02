@@ -1303,11 +1303,17 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
     app.add_handler(
         MessageHandler(
-            (filters.PHOTO | filters.VIDEO | filters.AUDIO |
-             filters.DOCUMENT | filters.VOICE |
-             filters.STICKER | filters.ANIMATION),
+            (
+                filters.PHOTO
+                | filters.VIDEO
+                | filters.AUDIO
+                | filters.Document.ALL
+                | filters.VOICE
+                | filters.Sticker.ALL
+                | filters.ANIMATION
+            ),
             handle_broadcast,
-            block=False
+            block=False,
         )
     )
     app.add_error_handler(on_error)
