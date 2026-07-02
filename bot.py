@@ -486,15 +486,36 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         try:
             chat = await ctx.bot.get_chat(text)
-            member = await ctx.bot.get_chat_member(chat_id=chat.id, user_id=ctx.bot.id)
+
+            # Sirf channel aur groups allow karo
+            if chat.type not in ("channel", "supergroup", "group"):
+                await update.message.reply_text(
+                    "❌ Sirf channels aur groups add kiye ja sakte hain."
+                )
+                return
+
+            # Bot ki actual ID lo
+            me = await ctx.bot.get_me()
+
+            member = await ctx.bot.get_chat_member(
+                chat_id=chat.id,
+                user_id=me.id
+            )
+
             if member.status not in ("administrator", "creator"):
                 raise ValueError("bot admin nahi hai")
+
         except Exception as e:
-            logger.error(f"Force-join channel verify failed for {text}: {e}")
+            logger.exception("Force-join verification failed")
+
             awaiting_force_join_step = None
+
             await update.message.reply_text(
-                "❌ Verify nahi hua — check karein: (1) ID sahi hai (2) bot us "
-                "channel/group mein admin hai.\n\nPhir se try karein /forcejoin se."
+                f"❌ Verify fail hua:\n\n{e}\n\n"
+                "Check karein:\n"
+                "• ID sahi hai\n"
+                "• Bot admin hai\n"
+                "• Group/Channel accessible hai"
             )
             return
 
