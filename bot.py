@@ -653,10 +653,12 @@ async def broadcast(update, context):
 
 
 async def handle_broadcast(update, context):
+
+    global BROADCAST_MODE
+
     logger.info(
         f"handle_broadcast called, mode={BROADCAST_MODE}, text={update.message.text}"
     )
-    global BROADCAST_MODE
 
     if not BROADCAST_MODE:
         return
