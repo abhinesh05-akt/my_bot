@@ -1297,10 +1297,19 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_broadcast_cancel, pattern=r"^broadcast_cancel$"))
     
 
-    # app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,handle_broadcast,block=False))
+    
     		
     app.add_handler(ChatJoinRequestHandler(cb_chat_join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
+    app.add_handler(
+        MessageHandler(
+            (filters.PHOTO | filters.VIDEO | filters.AUDIO |
+             filters.DOCUMENT | filters.VOICE |
+             filters.STICKER | filters.ANIMATION),
+            handle_broadcast,
+            block=False
+        )
+    )
     app.add_error_handler(on_error)
 
     app.job_queue.run_repeating(auto_delete_job, interval=30, first=10)
