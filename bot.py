@@ -23,7 +23,7 @@ except ImportError:
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes
+    ChatJoinRequestHandler, filters, ContextTypes
 )
 from telegram.request import HTTPXRequest
 
@@ -88,15 +88,25 @@ selected_folder_id: int | None = None
 awaiting_new_folder_name: bool = False
 awaiting_channel_id_for_folder: int | None = None
 
+# Force-join add flow: "id" step waits for channel_id, "link" step waits
+# for the invite link for the channel_id captured in the previous step.
+awaiting_force_join_step: str | None = None   # None | "id" | "link"
+force_join_pending_channel_id: str | None = None
+force_join_pending_title: str | None = None
+
 
 def _reset_owner_state():
     global upload_session, pending_links, selected_folder_id
     global awaiting_new_folder_name, awaiting_channel_id_for_folder
+    global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
     upload_session = None
     pending_links = None
     selected_folder_id = None
     awaiting_new_folder_name = False
     awaiting_channel_id_for_folder = None
+    awaiting_force_join_step = None
+    force_join_pending_channel_id = None
+    force_join_pending_title = None
 
 
 # ── /folders ──────────────────────────────────────────────────────────────────
@@ -174,6 +184,170 @@ async def cb_folder_setchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📡 Channel ID bhejein (e.g. @channelusername ya -100xxxxxxxxxx).\n\n"
         "⚠️ Bot ko us channel mein admin banana zaroori hai (Post Messages permission ke saath)."
     )
+
+
+# ── Force-join ────────────────────────────────────────────────────────────────
+async def _has_join_request(channel_id: str, user_id: int) -> bool:
+    row = await db.fetchrow(
+        "SELECT 1 FROM join_requests WHERE channel_id = $1 AND user_id = $2",
+        channel_id, str(user_id)
+    )
+    return row is not None
+
+
+async def _is_member(bot, channel_id: str, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+        if member.status not in ("left", "kicked"):
+            return True
+    except Exception as e:
+        # get_chat_member errors (bot lost admin, channel deleted, bad
+        # stored id, or user not found because they only have a pending
+        # join request) — fall through to the join_requests check below
+        # instead of failing closed outright.
+        logger.warning(f"get_chat_member failed for channel {channel_id}, user {user_id}: {e}")
+
+    # Not (yet) an approved member. Auto-approve is removed — the bot no
+    # longer approves join requests itself. Instead, a recorded join
+    # request (sent, whether or not the owner has approved it) is enough
+    # to pass the gate. NOTE: this means the gate can be satisfied just by
+    # clicking "Request to Join" without ever actually being let into the
+    # channel — weaker than a real membership check, by design per request.
+    return await _has_join_request(channel_id, user_id)
+
+
+async def _check_force_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE, batch_id: int | None) -> bool:
+    """Returns True if the user may proceed. Otherwise sends a join prompt
+    (with per-channel join buttons + a recheck button) and returns False.
+    Owner always bypasses."""
+    user = update.effective_user
+    if user.id == OWNER_ID:
+        return True
+
+    channels = await db.fetch(
+        "SELECT id, channel_id, invite_link, title FROM force_join_channels ORDER BY id"
+    )
+    if not channels:
+        return True
+
+    not_joined = [c for c in channels if not await _is_member(ctx.bot, c["channel_id"], user.id)]
+    if not not_joined:
+        return True
+
+    rows = [
+        [InlineKeyboardButton(f"📢 Join {c['title'] or 'Channel'}", url=c["invite_link"])]
+        for c in not_joined
+    ]
+    recheck_data = f"checkjoin_{batch_id}" if batch_id is not None else "checkjoin_0"
+    rows.append([InlineKeyboardButton("✅ Maine Join Kar Liya", callback_data=recheck_data)])
+
+    text = (
+        "🔒 Is bot ko use karne se pehle neeche diye gaye channel(s)/group(s) "
+        "join karna zaroori hai.\n\n"
+        "⚠️ Agar channel private hai to join request bhejni hogi (approve hone ka "
+        "wait karne ki zaroorat nahi — request bhejte hi \"Maine Join Kar Liya\" "
+        "dobara dabayein)."
+    )
+    if update.callback_query:
+        await update.callback_query.answer("Abhi tak sabhi channels join nahi hue.", show_alert=True)
+        await update.callback_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    return False
+
+
+async def cb_checkjoin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data.replace("checkjoin_", "")
+    batch_id = int(data) if data != "0" else None
+
+    ok = await _check_force_join(update, ctx, batch_id)
+    if not ok:
+        return
+
+    await update.callback_query.answer("✅ Verified!")
+    if batch_id is not None:
+        await _deliver_batch(batch_id, update.effective_chat.id, update.effective_user.id, ctx)
+    else:
+        await update.callback_query.message.reply_text("✅ Verify ho gaya. /start dobara bhejein.")
+
+
+async def cmd_forcejoin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    await _show_force_join_management(update, ctx)
+
+
+async def _show_force_join_management(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    channels = await db.fetch("SELECT id, title, channel_id FROM force_join_channels ORDER BY id")
+    rows = [
+        [
+            InlineKeyboardButton(f"❌ {c['title'] or c['channel_id']}", callback_data=f"forcejoin_remove_{c['id']}")
+        ]
+        for c in channels
+    ]
+    rows.append([InlineKeyboardButton("➕ Add Channel/Group", callback_data="forcejoin_add")])
+
+    text = "🔒 *Force Join Channels*\n\nRemove karne ke liye tap karein, ya naya add karein:" if channels \
+        else "🔒 Koi force-join channel set nahi hai.\n\n➕ Add Channel/Group se shuru karein."
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown"
+        )
+
+
+async def cb_forcejoin_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    await _show_force_join_management(update, ctx)
+
+
+async def cb_forcejoin_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    _reset_owner_state()
+    global awaiting_force_join_step
+    awaiting_force_join_step = "id"
+    await update.callback_query.edit_message_text(
+        "📡 Channel/Group ki ID ya @username bhejein (e.g. @channelusername ya -100xxxxxxxxxx).\n\n"
+        "⚠️ Bot ko wahan admin banana zaroori hai (members dekhne ke liye, aur join "
+        "requests receive karne ke liye — bot unhe approve NAHI karega, sirf record karega)."
+    )
+
+
+async def cb_forcejoin_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    row_id = int(update.callback_query.data.replace("forcejoin_remove_", ""))
+    await db.execute("DELETE FROM force_join_channels WHERE id = $1", row_id)
+    await _show_force_join_management(update, ctx)
+
+
+async def cb_chat_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Records join requests for any channel/group registered under
+    /forcejoin. Does NOT approve them — approval is left to the owner
+    (manually, in Telegram). The force-join gate treats "request sent"
+    as sufficient to proceed; see _is_member/_has_join_request."""
+    req = update.chat_join_request
+    chat_id_str = str(req.chat.id)
+    row = await db.fetchrow(
+        "SELECT id FROM force_join_channels WHERE channel_id = $1", chat_id_str
+    )
+    if not row:
+        return
+    try:
+        await db.execute(
+            """INSERT INTO join_requests (channel_id, user_id)
+               VALUES ($1, $2)
+               ON CONFLICT (channel_id, user_id) DO NOTHING""",
+            chat_id_str, str(req.from_user.id)
+        )
+    except Exception as e:
+        logger.warning(f"Failed to record join request for chat {chat_id_str}, user {req.from_user.id}: {e}")
 
 
 # ── /startupload ──────────────────────────────────────────────────────────────
@@ -292,6 +466,61 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📡 Ab is folder ka Channel ID bhejein (e.g. @channelusername ya -100xxxxxxxxxx).\n\n"
             f"⚠️ Bot ko us channel mein admin banana zaroori hai (Post Messages permission ke saath)."
         )
+        return
+
+    global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
+    if awaiting_force_join_step == "id":
+        if not text:
+            await update.message.reply_text("⚠️ Channel/Group ID khali nahi ho sakta.")
+            return
+        try:
+            chat = await ctx.bot.get_chat(text)
+            member = await ctx.bot.get_chat_member(chat_id=chat.id, user_id=ctx.bot.id)
+            if member.status not in ("administrator", "creator"):
+                raise ValueError("bot admin nahi hai")
+        except Exception as e:
+            logger.error(f"Force-join channel verify failed for {text}: {e}")
+            awaiting_force_join_step = None
+            await update.message.reply_text(
+                "❌ Verify nahi hua — check karein: (1) ID sahi hai (2) bot us "
+                "channel/group mein admin hai.\n\nPhir se try karein /forcejoin se."
+            )
+            return
+
+        existing = await db.fetchrow(
+            "SELECT id FROM force_join_channels WHERE channel_id = $1", str(chat.id)
+        )
+        if existing:
+            awaiting_force_join_step = None
+            await update.message.reply_text("⚠️ Ye channel/group already force-join list mein hai.")
+            return
+
+        force_join_pending_channel_id = str(chat.id)
+        force_join_pending_title = chat.title or chat.username or text
+        awaiting_force_join_step = "link"
+        await update.message.reply_text(
+            f"✅ \"{force_join_pending_title}\" verify ho gaya.\n\n"
+            f"🔗 Ab iska invite link bhejein — public channel ho to https://t.me/username "
+            f"bhi chalega, private ho to bot's export/create karke bheja hua link.\n\n"
+            f"ℹ️ Agar approval-required (join request) link chahiye, wo link Telegram mein "
+            f"khud generate karke yahan paste karein — bot ka approval-required link "
+            f"khud nahi banata."
+        )
+        return
+
+    if awaiting_force_join_step == "link":
+        if not text:
+            await update.message.reply_text("⚠️ Invite link khali nahi ho sakta.")
+            return
+        await db.execute(
+            "INSERT INTO force_join_channels (channel_id, invite_link, title) VALUES ($1, $2, $3)",
+            force_join_pending_channel_id, text, force_join_pending_title
+        )
+        title_done = force_join_pending_title
+        awaiting_force_join_step = None
+        force_join_pending_channel_id = None
+        force_join_pending_title = None
+        await update.message.reply_text(f"✅ \"{title_done}\" force-join list mein add ho gaya.")
         return
 
     if awaiting_channel_id_for_folder is not None:
@@ -549,7 +778,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "Commands:\n"
                 "/folders — folders manage karein (create/update channel)\n"
                 "/startupload — links upload karna shuru karein\n"
-                "/done — upload finish karein\n\n"
+                "/done — upload finish karein\n"
+                "/forcejoin — force-join channels/groups manage karein\n\n"
                 "Abhi active session nahi hai.",
                 parse_mode="Markdown"
             )
@@ -560,18 +790,28 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     batch_id = int(args[0].replace("batch_", ""))
-    chat_id  = update.effective_chat.id
-    user_id  = str(update.effective_user.id)
+
+    if not await _check_force_join(update, ctx, batch_id):
+        return
+
+    await _deliver_batch(batch_id, update.effective_chat.id, update.effective_user.id, ctx)
+
+
+async def _deliver_batch(batch_id: int, chat_id: int, user_id_int: int, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = str(user_id_int)
 
     batch = await db.fetchrow("SELECT id, total_links FROM batches WHERE id = $1", batch_id)
     if not batch:
-        await update.message.reply_text("❌ Yeh collection exist nahi karta.")
+        await ctx.bot.send_message(chat_id=chat_id, text="❌ Yeh collection exist nahi karta.")
         return
 
-    warn = await update.message.reply_text(
-        f"⚠️ *Warning*\n\n"
-        f"Ye {batch['total_links']} audio files *{DELETE_MINUTES} minute* baad delete ho jayenge.\n\n"
-        f"Abhi forward karein dusri jagah!\n\nBhej rahe hain... 📤",
+    warn = await ctx.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"⚠️ *Warning*\n\n"
+            f"Ye {batch['total_links']} audio files *{DELETE_MINUTES} minute* baad delete ho jayenge.\n\n"
+            f"Abhi forward karein dusri jagah!\n\nBhej rahe hain... 📤"
+        ),
         parse_mode="Markdown"
     )
 
@@ -585,9 +825,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sent_ids = [warn.message_id]
 
     if has_uncached and LIVE_DOWNLOAD_AVAILABLE:
-        delay_notice = await update.message.reply_text(
-            "⏳ Kuch audios pehli baar download ho rahe hain, isme *2 minute tak* lag sakte hain. "
-            "Cached audios turant aa jayenge.",
+        delay_notice = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏳ Kuch audios pehli baar download ho rahe hain, isme *2 minute tak* lag sakte hain. "
+                "Cached audios turant aa jayenge."
+            ),
             parse_mode="Markdown"
         )
         sent_ids.append(delay_notice.message_id)
@@ -679,20 +922,26 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 uncached_missing.append(audio["id"])
 
     if uncached_missing:
-        await update.message.reply_text("⚠️ Ye audio abhi available nahi hai.")
+        await ctx.bot.send_message(chat_id=chat_id, text="⚠️ Ye audio abhi available nahi hai.")
 
     other_failures = len(failed_audios) - len(uncached_missing)
     if other_failures > 0:
-        await update.message.reply_text(
-            f"⚠️ {other_failures}/{len(audios)} audio bhejne mein fail hue "
-            f"({MAX_ATTEMPTS} attempts ke baad bhi). Phir se /start try karein."
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ {other_failures}/{len(audios)} audio bhejne mein fail hue "
+                f"({MAX_ATTEMPTS} attempts ke baad bhi). Phir se /start try karein."
+            )
         )
 
     sent_count = len(audios) - len(failed_audios)
     if sent_count > 0:
-        closing = await update.message.reply_text(
-            f"✅ {sent_count} audio files bhej diye gaye.\n\n"
-            f"⏳ Ye *{DELETE_MINUTES} minute* mein delete ho jayenge — abhi forward kar lein!",
+        closing = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ {sent_count} audio files bhej diye gaye.\n\n"
+                f"⏳ Ye *{DELETE_MINUTES} minute* mein delete ho jayenge — abhi forward kar lein!"
+            ),
             parse_mode="Markdown"
         )
         sent_ids.append(closing.message_id)
@@ -770,13 +1019,19 @@ def main():
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("folders", cmd_folders))
+    app.add_handler(CommandHandler("forcejoin", cmd_forcejoin))
 
     app.add_handler(CallbackQueryHandler(cb_folder_new, pattern=r"^folder_new$"))
     app.add_handler(CallbackQueryHandler(cb_folder_list, pattern=r"^folder_list$"))
     app.add_handler(CallbackQueryHandler(cb_folder_manage, pattern=r"^folder_manage_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_folder_setchannel, pattern=r"^folder_setchannel_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_upload_folder, pattern=r"^upload_folder_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_forcejoin_list, pattern=r"^forcejoin_list$"))
+    app.add_handler(CallbackQueryHandler(cb_forcejoin_add, pattern=r"^forcejoin_add$"))
+    app.add_handler(CallbackQueryHandler(cb_forcejoin_remove, pattern=r"^forcejoin_remove_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_checkjoin, pattern=r"^checkjoin_\d+$"))
 
+    app.add_handler(ChatJoinRequestHandler(cb_chat_join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
     app.add_error_handler(on_error)
 

@@ -110,3 +110,22 @@ class Database:
                 UNIQUE(folder_id, page_index)
             )
         """)
+
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS force_join_channels (
+                id SERIAL PRIMARY KEY,
+                channel_id TEXT NOT NULL UNIQUE,
+                invite_link TEXT NOT NULL,
+                title TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS join_requests (
+                channel_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                requested_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (channel_id, user_id)
+            )
+        """)
