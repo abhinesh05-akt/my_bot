@@ -449,6 +449,13 @@ async def _repost_all_pages_for_folder(folder_id, folder_name, new_channel_id, u
 
 # ── Text message handler ──────────────────────────────────────────────────────
 async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global awaiting_new_folder_name
+    global awaiting_channel_id_for_folder
+    global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
+    global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
+    global pending_links
+    global pending_broadcast_text
+    
     logger.info(
         f"handle_links: text={update.message.text}, "
         f"force_step={awaiting_force_join_step}"
@@ -458,7 +465,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = (update.message.text or "").strip()
 
-    global awaiting_new_folder_name
+    
     if awaiting_new_folder_name:
         if not text:
             await update.message.reply_text("⚠️ Folder ka naam khali nahi ho sakta.")
@@ -474,7 +481,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        global awaiting_channel_id_for_folder
+        
         awaiting_channel_id_for_folder = folder_id
         await update.message.reply_text(
             f"✅ Folder \"{text}\" ban gaya.\n\n"
@@ -483,7 +490,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
+    
     if awaiting_force_join_step == "id":
         if not text:
             await update.message.reply_text("⚠️ Channel/Group ID khali nahi ho sakta.")
@@ -588,7 +595,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _repost_all_pages_for_folder(folder_id, folder_row["name"], text, update, ctx)
         return
 
-    global pending_links
+  
     if pending_links is not None:
         if not text:
             await update.message.reply_text("⚠️ Batch ka naam khali nahi ho sakta. Phir se bhejein.")
@@ -604,7 +611,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Broadcast ke liye text message bhejein.")
             return
 
-        global pending_broadcast_text
+        
         pending_broadcast_text = text
         recipient_count = await db.fetchval(
             "SELECT COUNT(*) FROM users WHERE user_id != $1", str(OWNER_ID)
