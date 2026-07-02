@@ -450,16 +450,21 @@ async def _repost_all_pages_for_folder(folder_id, folder_name, new_channel_id, u
 # ── Text message handler ──────────────────────────────────────────────────────
 async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
+    global upload_session
+    global pending_links
+    global selected_folder_id
+    global awaiting_new_folder_name
+    global awaiting_channel_id_for_folder
+    global awaiting_force_join_step
+    global force_join_pending_channel_id
+    global force_join_pending_title
+    global pending_broadcast_text
+
     logger.info(
         f"handle_links: text={update.message.text}, "
         f"force_step={awaiting_force_join_step}"
     )
-    global awaiting_new_folder_name
-    global awaiting_channel_id_for_folder
-    global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
-    global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
-    global pending_links
-    global pending_broadcast_text
+
     
 
     if update.effective_user.id != OWNER_ID:
