@@ -1169,6 +1169,7 @@ async def _setup_bot_commands(application: Application):
         BotCommand("startupload", "Naya batch upload shuru karein"),
         BotCommand("done", "Current upload batch finish karein"),
         BotCommand("forcejoin", "Force-join channels manage karein"),
+        BotCommand("broadcast", "broadcast msg fro "),
     ]
 
     try:
@@ -1237,6 +1238,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("folders", cmd_folders))
     app.add_handler(CommandHandler("forcejoin", cmd_forcejoin))
+    app.add_handler(CommandHandler("broadcast", broadcast))
 
     app.add_handler(CallbackQueryHandler(cb_folder_new, pattern=r"^folder_new$"))
     app.add_handler(CallbackQueryHandler(cb_folder_list, pattern=r"^folder_list$"))
@@ -1249,7 +1251,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_checkjoin, pattern=r"^checkjoin_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_broadcast_confirm, pattern=r"^broadcast_confirm$"))
     app.add_handler(CallbackQueryHandler(cb_broadcast_cancel, pattern=r"^broadcast_cancel$"))
-    app.add_handler(CommandHandler("broadcast", broadcast))
+    
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,handle_broadcast,block=False))
     		
