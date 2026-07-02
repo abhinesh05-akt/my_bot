@@ -20,12 +20,16 @@ try:
 except ImportError:
     pass
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ChatJoinRequestHandler, filters, ContextTypes
 )
 from telegram.request import HTTPXRequest
+from telegram.error import Forbidden
 
 from db import Database
 
@@ -94,11 +98,17 @@ awaiting_force_join_step: str | None = None   # None | "id" | "link"
 force_join_pending_channel_id: str | None = None
 force_join_pending_title: str | None = None
 
+# Broadcast flow: owner's fallback text (no other active state) is held here
+# until they confirm via inline button — NOT sent immediately, so a stray
+# typo with no active session can't blast every user.
+pending_broadcast_text: str | None = None
+
 
 def _reset_owner_state():
     global upload_session, pending_links, selected_folder_id
     global awaiting_new_folder_name, awaiting_channel_id_for_folder
     global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
+    global pending_broadcast_text
     upload_session = None
     pending_links = None
     selected_folder_id = None
@@ -107,6 +117,7 @@ def _reset_owner_state():
     awaiting_force_join_step = None
     force_join_pending_channel_id = None
     force_join_pending_title = None
+    pending_broadcast_text = None
 
 
 # ── /folders ──────────────────────────────────────────────────────────────────
@@ -564,9 +575,31 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if upload_session is None:
+        if not text:
+            await update.message.reply_text("⚠️ Broadcast ke liye text message bhejein.")
+            return
+
+        global pending_broadcast_text
+        pending_broadcast_text = text
+        recipient_count = await db.fetchval(
+            "SELECT COUNT(*) FROM users WHERE user_id != $1", str(OWNER_ID)
+        )
+
+        if not recipient_count:
+            pending_broadcast_text = None
+            await update.message.reply_text("ℹ️ Koi user nahi hai jinhe broadcast kiya ja sake.")
+            return
+
+        rows = [[
+            InlineKeyboardButton("✅ Confirm Broadcast", callback_data="broadcast_confirm"),
+            InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel"),
+        ]]
         await update.message.reply_text(
-            "ℹ️ Koi active session nahi hai.\n\n"
-            "/startupload se naya upload shuru karein, ya /folders se folders manage karein."
+            f"📢 Ye message *{recipient_count} user(s)* ko bhejna hai?\n\n"
+            f"—\n{text}\n—\n\n"
+            f"⚠️ Ye action undo nahi ho sakta.",
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode="Markdown"
         )
         return
 
@@ -579,6 +612,104 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ {len(links)} link(s) add hue. Total: {len(upload_session)}"
     )
+
+
+BROADCAST_MODE = False
+
+
+async def broadcast(update, context):
+    global BROADCAST_MODE
+
+    if update.effective_user.id != OWNER_ID:
+        return
+
+    BROADCAST_MODE = True
+    await update.message.reply_text(
+        "📢 Broadcast mode ON.\n\n"
+        "Ab text, photo, video, audio, document, voice, sticker ya animation bhejiye."
+    )
+
+
+async def handle_broadcast(update, context):
+    global BROADCAST_MODE
+
+    if not BROADCAST_MODE:
+        return
+
+    users = await db.fetch("SELECT DISTINCT user_id FROM sent_logs")
+
+    success = 0
+    failed = 0
+
+    for user in users:
+        uid = int(user["user_id"])
+
+        try:
+            if update.message.text:
+                await context.bot.send_message(uid, update.message.text)
+
+            elif update.message.photo:
+                await context.bot.send_photo(
+                    uid,
+                    update.message.photo[-1].file_id,
+                    caption=update.message.caption
+                )
+
+            elif update.message.video:
+                await context.bot.send_video(
+                    uid,
+                    update.message.video.file_id,
+                    caption=update.message.caption
+                )
+
+            elif update.message.audio:
+                await context.bot.send_audio(
+                    uid,
+                    update.message.audio.file_id,
+                    caption=update.message.caption
+                )
+
+            elif update.message.document:
+                await context.bot.send_document(
+                    uid,
+                    update.message.document.file_id,
+                    caption=update.message.caption
+                )
+
+            elif update.message.voice:
+                await context.bot.send_voice(
+                    uid,
+                    update.message.voice.file_id,
+                    caption=update.message.caption
+                )
+
+            elif update.message.animation:
+                await context.bot.send_animation(
+                    uid,
+                    update.message.animation.file_id,
+                    caption=update.message.caption
+                )
+
+            elif update.message.sticker:
+                await context.bot.send_sticker(
+                    uid,
+                    update.message.sticker.file_id
+                )
+
+            success += 1
+
+        except:
+            failed += 1
+
+    BROADCAST_MODE = False
+
+    await update.message.reply_text(
+        f"✅ Broadcast complete.\n"
+        f"Success: {success}\n"
+        f"Failed: {failed}"
+    )
+
+
 
 
 # ── /done ─────────────────────────────────────────────────────────────────────
@@ -771,6 +902,12 @@ async def render_folder_page(folder_id: int, folder_name: str, channel_id: str, 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
 
+    await db.execute(
+        """INSERT INTO users (user_id) VALUES ($1)
+           ON CONFLICT (user_id) DO UPDATE SET last_seen = NOW()""",
+        str(update.effective_user.id)
+    )
+
     if update.effective_user.id == OWNER_ID:
         if not args or not args[0].startswith("batch_"):
             await update.message.reply_text(
@@ -953,6 +1090,55 @@ async def _deliver_batch(batch_id: int, chat_id: int, user_id_int: int, ctx: Con
     )
 
 
+async def cb_broadcast_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    global pending_broadcast_text
+    pending_broadcast_text = None
+    await update.callback_query.edit_message_text("❌ Broadcast cancel ho gaya.")
+
+
+async def cb_broadcast_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    global pending_broadcast_text
+    text = pending_broadcast_text
+    pending_broadcast_text = None
+
+    if not text:
+        await update.callback_query.edit_message_text("⚠️ Broadcast text mil nahi raha — phir se try karein.")
+        return
+
+    await update.callback_query.edit_message_text("⏳ Broadcast bheja ja raha hai...")
+
+    rows = await db.fetch("SELECT user_id FROM users WHERE user_id != $1", str(OWNER_ID))
+    sent, failed, blocked = 0, 0, 0
+
+    for row in rows:
+        uid = row["user_id"]
+        try:
+            await ctx.bot.send_message(chat_id=int(uid), text=text)
+            sent += 1
+        except Forbidden:
+            # User blocked the bot or deleted their account — remove them
+            # so future broadcasts don't keep retrying a dead recipient.
+            blocked += 1
+            await db.execute("DELETE FROM users WHERE user_id = $1", uid)
+        except Exception as e:
+            failed += 1
+            logger.error(f"Broadcast to {uid} failed: {e}")
+
+    await ctx.bot.send_message(
+        chat_id=OWNER_ID,
+        text=(
+            f"✅ Broadcast done.\n\n"
+            f"Sent: {sent}\n"
+            f"Blocked/removed: {blocked}\n"
+            f"Other failures: {failed}"
+        )
+    )
+
+
 # ── Auto-delete job ───────────────────────────────────────────────────────────
 async def auto_delete_job(ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow()
@@ -969,10 +1155,41 @@ async def auto_delete_job(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+async def _setup_bot_commands(application: Application):
+    """Public users only ever see /start — everything else here is
+    owner-gated in the handlers themselves (see OWNER_ID checks above), so
+    showing them in the global menu would just be dead buttons for regular
+    users. Owner gets the full admin menu via a chat-scoped command list,
+    which overrides the default scope only inside OWNER_ID's own chat."""
+    public_commands = [
+        BotCommand("start", "Bot shuru karein"),
+    ]
+    owner_commands = public_commands + [
+        BotCommand("folders", "Folders manage karein"),
+        BotCommand("startupload", "Naya batch upload shuru karein"),
+        BotCommand("done", "Current upload batch finish karein"),
+        BotCommand("forcejoin", "Force-join channels manage karein"),
+    ]
+
+    try:
+        await application.bot.set_my_commands(
+            public_commands, scope=BotCommandScopeDefault()
+        )
+        await application.bot.set_my_commands(
+            owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_ID)
+        )
+        logger.info("Bot command menus registered (default + owner scope).")
+    except Exception as e:
+        # Non-fatal — command menu is cosmetic, bot should still run.
+        logger.error(f"Failed to set bot commands: {e}")
+
+
 async def post_init(application: Application):
     await db.connect()
     await db.init_schema()
     logger.info("Database connected and schema ready.")
+
+    await _setup_bot_commands(application)
 
     try:
         await application.bot.send_message(
@@ -1030,7 +1247,12 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_forcejoin_add, pattern=r"^forcejoin_add$"))
     app.add_handler(CallbackQueryHandler(cb_forcejoin_remove, pattern=r"^forcejoin_remove_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_checkjoin, pattern=r"^checkjoin_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_broadcast_confirm, pattern=r"^broadcast_confirm$"))
+    app.add_handler(CallbackQueryHandler(cb_broadcast_cancel, pattern=r"^broadcast_cancel$"))
+    app.add_handler(CommandHandler("broadcast", broadcast))
 
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,handle_broadcast,block=False))
+    		
     app.add_handler(ChatJoinRequestHandler(cb_chat_join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
     app.add_error_handler(on_error)

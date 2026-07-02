@@ -129,3 +129,11 @@ class Database:
                 PRIMARY KEY (channel_id, user_id)
             )
         """)
+
+        await self.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                first_seen TIMESTAMP DEFAULT NOW(),
+                last_seen TIMESTAMP DEFAULT NOW()
+            )
+        """)
