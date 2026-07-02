@@ -1,6 +1,5 @@
 import asyncpg
 import ssl
-import os
 
 
 class Database:
@@ -9,37 +8,26 @@ class Database:
         self.pool: asyncpg.Pool | None = None
 
     async def connect(self):
-        # Cloud Postgres providers don't agree on whether sslmode appears in
-        # the URL — Neon usually includes it, Supabase often doesn't even
-        # though SSL is still required server-side. String-matching for
-        # "sslmode=require" is unreliable across providers. Instead: assume
-        # SSL is required unless the host is explicitly local, since that's
-        # the only case where SSL is reliably absent.
-        is_local = any(h in self.url for h in ("localhost", "127.0.0.1"))
+        is_local = any(
+            host in self.url
+            for host in ("localhost", "127.0.0.1")
+        )
 
         ssl_context = None
+
         if not is_local:
             ssl_context = ssl.create_default_context()
-            # Supabase's connection pooler (Supavisor) signs with Supabase's
-            # own CA, not one in the OS default trust store — that's why a
-            # plain create_default_context() rejects it as "self-signed".
-            # Fix is to add Supabase's real CA, not disable verification.
-            # Download prod-ca-2021.crt from: Supabase Dashboard -> Project
-            # Settings -> Database -> SSL Configuration, save it next to
-            # this file as supabase-ca.crt, commit it (it's a public CA
-            # cert, not a secret). Harmless no-op for Neon/other hosts.
-            supabase_ca_path = os.path.join(os.path.dirname(__file__), "supabase-ca.crt")
-            if os.path.exists(supabase_ca_path):
-                ssl_context.load_verify_locations(cafile=supabase_ca_path)
+
+            # Supabase Session Pooler compatibility
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
 
         self.pool = await asyncpg.create_pool(
             self.url,
             ssl=ssl_context,
             min_size=1,
             max_size=10,
-            statement_cache_size=0,  # required if DATABASE_URL points at a PgBouncer
-                                      # transaction-mode pooler (e.g. Supabase port 6543);
-                                      # harmless no-op on a direct connection.
+            statement_cache_size=0,
         )
 
     async def disconnect(self):
@@ -71,6 +59,7 @@ class Database:
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+
         await self.execute("""
             CREATE TABLE IF NOT EXISTS batches (
                 id SERIAL PRIMARY KEY,
@@ -81,13 +70,18 @@ class Database:
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        # Migrations for deployments created before folders existed.
+
         await self.execute("""
-            ALTER TABLE batches ADD COLUMN IF NOT EXISTS name TEXT
+            ALTER TABLE batches
+            ADD COLUMN IF NOT EXISTS name TEXT
         """)
+
         await self.execute("""
-            ALTER TABLE batches ADD COLUMN IF NOT EXISTS folder_id INTEGER REFERENCES folders(id)
+            ALTER TABLE batches
+            ADD COLUMN IF NOT EXISTS folder_id INTEGER
+            REFERENCES folders(id)
         """)
+
         await self.execute("""
             CREATE TABLE IF NOT EXISTS audios (
                 id SERIAL PRIMARY KEY,
@@ -96,6 +90,7 @@ class Database:
                 telegram_file_id TEXT
             )
         """)
+
         await self.execute("""
             CREATE TABLE IF NOT EXISTS sent_logs (
                 id SERIAL PRIMARY KEY,
@@ -105,10 +100,7 @@ class Database:
                 delete_at TIMESTAMP NOT NULL
             )
         """)
-        # Ek folder ke batches ko 20-20 ke groups (pages) mein channel par
-        # post karne ke liye. Har page apna ek hi message hai jo naye
-        # batches add hone par edit hota hai; 20 buttons bharne ke baad
-        # naya page (naya message) shuru hota hai.
+
         await self.execute("""
             CREATE TABLE IF NOT EXISTS folder_pages (
                 id SERIAL PRIMARY KEY,
