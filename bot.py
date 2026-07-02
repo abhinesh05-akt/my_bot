@@ -1297,7 +1297,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_broadcast_cancel, pattern=r"^broadcast_cancel$"))
     
 
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,handle_broadcast,block=False))
+    # app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,handle_broadcast,block=False))
     		
     app.add_handler(ChatJoinRequestHandler(cb_chat_join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
