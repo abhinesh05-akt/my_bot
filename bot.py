@@ -13,6 +13,8 @@ import json
 import re
 import time
 from datetime import datetime, timedelta
+from io import BytesIO
+
 
 try:
     from dotenv import load_dotenv
@@ -83,7 +85,22 @@ PORT = int(os.environ.get("PORT", "7860"))
 # Agar set hai, har outbound call is Worker URL se route hoga.
 TELEGRAM_API_BASE_URL = os.environ.get("TELEGRAM_API_BASE_URL", "").strip()
 
+# Optional — shown as an "UPDATE CHANNEL" button on the pre-send "Please
+# wait..." message. If unset, that button is simply omitted.
+UPDATE_CHANNEL_URL = os.environ.get("UPDATE_CHANNEL_URL", "").strip()
+
+UPDATE_SUPPORT_GROUP = os.environ.get("UPDATE_SUPPORT_GROUP", "").strip()
+
+# Optional — shown to a non-owner user who /starts the bot directly (no
+# batch_ payload). If unset, they get the old plain-text redirect instead.
+OTHER_BOT_URL = os.environ.get("OTHER_BOT_URL", "").strip()
+
 db = Database(DATABASE_URL)
+
+# In-flight deliveries the user has cancelled via the "please wait" screen.
+# Checked between audio sends in _deliver_batch; not a hard kill switch —
+# an audio already mid-upload when cancel is pressed still finishes.
+cancelled_deliveries: set[tuple[int, int]] = set()
 
 # ── In-memory owner state machine ────────────────────────────────────────────
 upload_session: list | None = None
@@ -142,8 +159,8 @@ async def _show_folder_management(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         rows.append([InlineKeyboardButton(label, callback_data=f"folder_manage_{f['id']}")])
     rows.append([InlineKeyboardButton("➕ New Folder", callback_data="folder_new")])
 
-    text = "📁 *Folders*\n\nManage karne ke liye tap karein, ya naya banayein:" if folders \
-        else "📁 Koi folder nahi hai abhi.\n\n➕ New Folder se shuru karein."
+    text = "📁 *Folders*\n\nTap to manage, or create a new one:" if folders \
+        else "📁 No folders yet.\n\n➕ Start with New Folder."
 
     if update.callback_query:
         await update.callback_query.edit_message_text(
@@ -161,7 +178,7 @@ async def cb_folder_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _reset_owner_state()
     global awaiting_new_folder_name
     awaiting_new_folder_name = True
-    await update.callback_query.edit_message_text("📁 Naye folder ka naam bhejein:")
+    await update.callback_query.edit_message_text("📁 Send the name for the new folder:")
 
 
 async def cb_folder_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -170,10 +187,10 @@ async def cb_folder_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     folder_id = int(update.callback_query.data.replace("folder_manage_", ""))
     folder = await db.fetchrow("SELECT id, name, channel_id FROM folders WHERE id = $1", folder_id)
     if not folder:
-        await update.callback_query.edit_message_text("❌ Folder nahi mila.")
+        await update.callback_query.edit_message_text("❌ Folder not found.")
         return
 
-    channel_line = folder["channel_id"] or "⚠️ set nahi hai"
+    channel_line = folder["channel_id"] or "⚠️ not set"
     text = f"📁 *{folder['name']}*\n\nChannel ID: `{channel_line}`"
     rows = [
         [InlineKeyboardButton("✏️ Update Channel ID", callback_data=f"folder_setchannel_{folder_id}")],
@@ -198,8 +215,8 @@ async def cb_folder_setchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global awaiting_channel_id_for_folder
     awaiting_channel_id_for_folder = folder_id
     await update.callback_query.edit_message_text(
-        "📡 Channel ID bhejein (e.g. @channelusername ya -100xxxxxxxxxx).\n\n"
-        "⚠️ Bot ko us channel mein admin banana zaroori hai (Post Messages permission ke saath)."
+        "📡 Send the Channel ID (e.g. @channelusername or -100xxxxxxxxxx).\n\n"
+        "⚠️ The bot must be made an admin in that channel (with Post Messages permission)."
     )
 
 
@@ -252,21 +269,26 @@ async def _check_force_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE, batc
         return True
 
     rows = [
-        [InlineKeyboardButton(f"📢 Join {c['title'] or 'Channel'}", url=c["invite_link"])]
-        for c in not_joined
+        [InlineKeyboardButton(f"🔗 Join Channel {i}", url=c["invite_link"])]
+        for i, c in enumerate(not_joined, start=1)
     ]
     recheck_data = f"checkjoin_{batch_id}" if batch_id is not None else "checkjoin_0"
-    rows.append([InlineKeyboardButton("✅ Maine Join Kar Liya", callback_data=recheck_data)])
+    rows.append([InlineKeyboardButton("🔄 Try Again", callback_data=recheck_data)])
 
+    arrows = " ".join(["⬇️"] * min(len(not_joined) * 3, 9))
     text = (
-        "🔒 Is bot ko use karne se pehle neeche diye gaye channel(s)/group(s) "
-        "join karna zaroori hai.\n\n"
-        "⚠️ Agar channel private hai to join request bhejni hogi (approve hone ka "
-        "wait karne ki zaroorat nahi — request bhejte hi \"Maine Join Kar Liya\" "
-        "dobara dabayein)."
+        f"❤️ HEY THERE ✨\n\n"
+        f"🔥 TO USE THIS BOT, YOU MUST\n"
+        f"JOIN ALL [{len(not_joined)}] CHANNELS.\n\n"
+        f"👇 JOIN ALL CHANNELS AND\n"
+        f"PRESS \"TRY AGAIN\".\n\n"
+        f"{arrows}\n\n"
+        f"⚠️ If a channel is private, you'll need to send a join request "
+        f"(no need to wait for approval — as soon as you've sent the "
+        f"request, press \"Try Again\")."
     )
     if update.callback_query:
-        await update.callback_query.answer("Abhi tak sabhi channels join nahi hue.", show_alert=True)
+        await update.callback_query.answer("You have not joined all the channels yet.", show_alert=True)
         await update.callback_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
     else:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
@@ -285,7 +307,7 @@ async def cb_checkjoin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if batch_id is not None:
         await _deliver_batch(batch_id, update.effective_chat.id, update.effective_user.id, ctx)
     else:
-        await update.callback_query.message.reply_text("✅ Verify ho gaya. /start dobara bhejein.")
+        await update.callback_query.message.reply_text("✅ Verified. Send /start again.")
 
 
 async def cmd_forcejoin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -305,8 +327,8 @@ async def _show_force_join_management(update: Update, ctx: ContextTypes.DEFAULT_
     ]
     rows.append([InlineKeyboardButton("➕ Add Channel/Group", callback_data="forcejoin_add")])
 
-    text = "🔒 *Force Join Channels*\n\nRemove karne ke liye tap karein, ya naya add karein:" if channels \
-        else "🔒 Koi force-join channel set nahi hai.\n\n➕ Add Channel/Group se shuru karein."
+    text = "🔒 *Force Join Channels*\n\nTap to remove, or add a new one:" if channels \
+        else "🔒 No force-join channel set yet.\n\n➕ Start with Add Channel/Group."
 
     if update.callback_query:
         await update.callback_query.edit_message_text(
@@ -331,9 +353,9 @@ async def cb_forcejoin_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global awaiting_force_join_step
     awaiting_force_join_step = "id"
     await update.callback_query.edit_message_text(
-        "📡 Channel/Group ki ID ya @username bhejein (e.g. @channelusername ya -100xxxxxxxxxx).\n\n"
-        "⚠️ Bot ko wahan admin banana zaroori hai (members dekhne ke liye, aur join "
-        "requests receive karne ke liye — bot unhe approve NAHI karega, sirf record karega)."
+        "📡 Send the Channel/Group ID or @username (e.g. @channelusername or -100xxxxxxxxxx).\n\n"
+        "⚠️ The bot must be made an admin there (to see members, and to receive join "
+        "requests — the bot will NOT approve them, only record them)."
     )
 
 
@@ -355,15 +377,15 @@ async def cb_forcejoin_editlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "SELECT id, channel_id, title FROM force_join_channels WHERE id = $1", row_id
     )
     if not row:
-        await update.callback_query.answer("⚠️ Channel nahi mila (shayad already remove ho chuka hai).", show_alert=True)
+        await update.callback_query.answer("⚠️ Channel not found (it may already have been removed).", show_alert=True)
         await _show_force_join_management(update, ctx)
         return
     awaiting_force_join_edit_channel_id = row["channel_id"]
     await update.callback_query.edit_message_text(
-        f"🔗 \"{row['title'] or row['channel_id']}\" ke liye naya invite link bhejein.\n\n"
-        "⚠️ Agar link expire ho raha hai ya 'invalid' dikha raha hai, Telegram mein naya link "
-        "banate waqt expiry date aur member limit dono OFF/blank rakhein — warna ye dobara "
-        "kuch time/uses ke baad invalid ho jayega."
+        f"🔗 Send a new invite link for \"{row['title'] or row['channel_id']}\".\n\n"
+        "⚠️ If the link is expiring or showing 'invalid', keep both the expiry date "
+        "and member limit OFF/blank when creating a new link in Telegram — otherwise "
+        "it will go invalid again after some time/uses."
     )
 
 
@@ -398,7 +420,7 @@ async def cmd_startupload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     folders = await db.fetch("SELECT id, name, channel_id FROM folders ORDER BY name")
     if not folders:
         await update.message.reply_text(
-            "❌ Koi folder nahi hai. Pehle /folders se ek folder banayein."
+            "❌ No folders exist. Create one first with /folders."
         )
         return
 
@@ -408,7 +430,7 @@ async def cmd_startupload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for f in folders
     ]
     await update.message.reply_text(
-        "📁 Kis folder mein upload karna hai?",
+        "📁 Which folder do you want to upload to?",
         reply_markup=InlineKeyboardMarkup(rows)
     )
 
@@ -419,12 +441,12 @@ async def cb_upload_folder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     folder_id = int(update.callback_query.data.replace("upload_folder_", ""))
     folder = await db.fetchrow("SELECT id, name, channel_id FROM folders WHERE id = $1", folder_id)
     if not folder:
-        await update.callback_query.edit_message_text("❌ Folder nahi mila.")
+        await update.callback_query.edit_message_text("❌ Folder not found.")
         return
     if not folder["channel_id"]:
         await update.callback_query.edit_message_text(
-            f"⚠️ \"{folder['name']}\" ka channel_id set nahi hai.\n"
-            f"/folders se set karein, phir /startupload phir se try karein."
+            f"⚠️ \"{folder['name']}\" has no channel_id set.\n"
+            f"Set it via /folders, then try /startupload again."
         )
         return
 
@@ -433,7 +455,7 @@ async def cb_upload_folder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     selected_folder_id = folder_id
 
     await update.callback_query.edit_message_text(
-        f"✅ Folder: *{folder['name']}*\n\nGoogle Drive links bhejiye.\n/done likhein jab sab links bhej dein.",
+        f"✅ Folder: *{folder['name']}*\n\nSend the Google Drive links.\nType /done once you've sent all the links.",
         parse_mode="Markdown"
     )
 
@@ -444,12 +466,12 @@ async def _repost_all_pages_for_folder(folder_id, folder_name, new_channel_id, u
         folder_id
     )
     if not batches:
-        await update.message.reply_text("ℹ️ Is folder mein abhi koi batch nahi hai — repost karne ko kuch nahi.")
+        await update.message.reply_text("ℹ️ This folder has no batches yet — nothing to repost.")
         return
 
     total_pages = (len(batches) + PAGE_SIZE - 1) // PAGE_SIZE
     await update.message.reply_text(
-        f"🔁 {total_pages} message(s) naye channel mein repost ho rahe hain... isme time lagega."
+        f"🔁 Reposting {total_pages} message(s) to the new channel... this will take some time."
     )
 
     REPOST_DELAY = 2
@@ -470,9 +492,9 @@ async def _repost_all_pages_for_folder(folder_id, folder_name, new_channel_id, u
 
         await asyncio.sleep(REPOST_DELAY)
 
-    summary = f"✅ {success_count}/{total_pages} messages repost ho gaye naye channel mein."
+    summary = f"✅ {success_count}/{total_pages} messages reposted to the new channel."
     if failed_pages:
-        summary += f"\n⚠️ Fail hue: page #{', #'.join(str(i) for i in failed_pages)}"
+        summary += f"\n⚠️ Failed: page #{', #'.join(str(i) for i in failed_pages)}"
     await update.message.reply_text(summary)
 
 
@@ -486,7 +508,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global awaiting_new_folder_name
     if awaiting_new_folder_name:
         if not text:
-            await update.message.reply_text("⚠️ Folder ka naam khali nahi ho sakta.")
+            await update.message.reply_text("⚠️ Folder name cannot be empty.")
             return
         awaiting_new_folder_name = False
         try:
@@ -495,36 +517,36 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             await update.message.reply_text(
-                f"⚠️ \"{text}\" naam ka folder already exist karta hai. Phir se /folders try karein."
+                f"⚠️ A folder named \"{text}\" already exists. Try /folders again."
             )
             return
 
         global awaiting_channel_id_for_folder
         awaiting_channel_id_for_folder = folder_id
         await update.message.reply_text(
-            f"✅ Folder \"{text}\" ban gaya.\n\n"
-            f"📡 Ab is folder ka Channel ID bhejein (e.g. @channelusername ya -100xxxxxxxxxx).\n\n"
-            f"⚠️ Bot ko us channel mein admin banana zaroori hai (Post Messages permission ke saath)."
+            f"✅ Folder \"{text}\" created.\n\n"
+            f"📡 Now send this folder's Channel ID (e.g. @channelusername or -100xxxxxxxxxx).\n\n"
+            f"⚠️ The bot must be made an admin in that channel (with Post Messages permission)."
         )
         return
 
     global awaiting_force_join_edit_channel_id
     if awaiting_force_join_edit_channel_id is not None:
         if not text:
-            await update.message.reply_text("⚠️ Invite link khali nahi ho sakta.")
+            await update.message.reply_text("⚠️ Invite link cannot be empty.")
             return
         await db.execute(
             "UPDATE force_join_channels SET invite_link = $1 WHERE channel_id = $2",
             text, awaiting_force_join_edit_channel_id
         )
         awaiting_force_join_edit_channel_id = None
-        await update.message.reply_text("✅ Invite link update ho gaya.")
+        await update.message.reply_text("✅ Invite link updated.")
         return
 
     global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
     if awaiting_force_join_step == "id":
         if not text:
-            await update.message.reply_text("⚠️ Channel/Group ID khali nahi ho sakta.")
+            await update.message.reply_text("⚠️ Channel/Group ID cannot be empty.")
             return
         try:
             chat = await ctx.bot.get_chat(text)
@@ -532,7 +554,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Sirf channel aur groups allow karo
             if chat.type not in ("channel", "supergroup", "group"):
                 await update.message.reply_text(
-                    "❌ Sirf channels aur groups add kiye ja sakte hain."
+                    "❌ Only channels and groups can be added."
                 )
                 return
 
@@ -545,7 +567,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
 
             if member.status not in ("administrator", "creator"):
-                raise ValueError("bot admin nahi hai")
+                raise ValueError("bot is not an admin")
 
         except Exception as e:
             logger.exception("Force-join verification failed")
@@ -553,11 +575,11 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             awaiting_force_join_step = None
 
             await update.message.reply_text(
-                f"❌ Verify fail hua:\n\n{e}\n\n"
-                "Check karein:\n"
-                "• ID sahi hai\n"
-                "• Bot admin hai\n"
-                "• Group/Channel accessible hai"
+                f"❌ Verification failed:\n\n{e}\n\n"
+                "Please check:\n"
+                "• The ID is correct\n"
+                "• The bot is an admin\n"
+                "• The group/channel is accessible"
             )
             return
 
@@ -566,25 +588,25 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         if existing:
             awaiting_force_join_step = None
-            await update.message.reply_text("⚠️ Ye channel/group already force-join list mein hai.")
+            await update.message.reply_text("⚠️ This channel/group is already in the force-join list.")
             return
 
         force_join_pending_channel_id = str(chat.id)
         force_join_pending_title = chat.title or chat.username or text
         awaiting_force_join_step = "link"
         await update.message.reply_text(
-            f"✅ \"{force_join_pending_title}\" verify ho gaya.\n\n"
-            f"🔗 Ab iska invite link bhejein — public channel ho to https://t.me/username "
-            f"bhi chalega, private ho to bot's export/create karke bheja hua link.\n\n"
-            f"ℹ️ Agar approval-required (join request) link chahiye, wo link Telegram mein "
-            f"khud generate karke yahan paste karein — bot ka approval-required link "
-            f"khud nahi banata."
+            f"✅ \"{force_join_pending_title}\" verified.\n\n"
+            f"🔗 Now send its invite link — for a public channel, https://t.me/username "
+            f"also works; for a private one, use a link exported/created via the bot.\n\n"
+            f"ℹ️ If you need an approval-required (join request) link, generate that "
+            f"link yourself in Telegram and paste it here — the bot does not create "
+            f"an approval-required link on its own."
         )
         return
 
     if awaiting_force_join_step == "link":
         if not text:
-            await update.message.reply_text("⚠️ Invite link khali nahi ho sakta.")
+            await update.message.reply_text("⚠️ Invite link cannot be empty.")
             return
         await db.execute(
             "INSERT INTO force_join_channels (channel_id, invite_link, title) VALUES ($1, $2, $3)",
@@ -594,12 +616,12 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         awaiting_force_join_step = None
         force_join_pending_channel_id = None
         force_join_pending_title = None
-        await update.message.reply_text(f"✅ \"{title_done}\" force-join list mein add ho gaya.")
+        await update.message.reply_text(f"✅ \"{title_done}\" added to the force-join list.")
         return
 
     if awaiting_channel_id_for_folder is not None:
         if not text:
-            await update.message.reply_text("⚠️ Channel ID khali nahi ho sakta.")
+            await update.message.reply_text("⚠️ Channel ID cannot be empty.")
             return
         folder_id = awaiting_channel_id_for_folder
 
@@ -610,14 +632,14 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.send_message(chat_id=text, text="✅ Channel linked successfully.")
             await db.execute("UPDATE folders SET channel_id = $1 WHERE id = $2", text, folder_id)
             awaiting_channel_id_for_folder = None
-            await update.message.reply_text("✅ Channel ID save ho gaya aur verify ho gaya.")
+            await update.message.reply_text("✅ Channel ID saved and verified.")
         except Exception as e:
             awaiting_channel_id_for_folder = None
             logger.error(f"Channel verify failed for folder {folder_id}: {e}")
             await update.message.reply_text(
-                f"❌ Channel ID save nahi hua — bot wahan post nahi kar saka.\n"
-                f"Check karein: (1) ID sahi hai (2) bot us channel mein admin hai (3) Post Messages permission ON hai.\n\n"
-                f"Phir se try karein /folders se."
+                f"❌ Channel ID not saved — the bot could not post there.\n"
+                f"Please check: (1) the ID is correct (2) the bot is an admin in that channel (3) Post Messages permission is ON.\n\n"
+                f"Try again via /folders."
             )
             return
 
@@ -629,17 +651,17 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global pending_links
     if pending_links is not None:
         if not text:
-            await update.message.reply_text("⚠️ Batch ka naam khali nahi ho sakta. Phir se bhejein.")
+            await update.message.reply_text("⚠️ Batch name cannot be empty. Please send it again.")
             return
         links = pending_links
         pending_links = None
-        await update.message.reply_text(f"⏳ \"{text}\" — {len(links)} links process ho rahe hain...")
+        await update.message.reply_text(f"⏳ \"{text}\" — processing {len(links)} links...")
         await process_links(links, text, selected_folder_id, update, ctx)
         return
 
     if upload_session is None:
         if not text:
-            await update.message.reply_text("⚠️ Broadcast ke liye text message bhejein.")
+            await update.message.reply_text("⚠️ Send a text message for the broadcast.")
             return
 
         global pending_broadcast_text
@@ -650,7 +672,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if not recipient_count:
             pending_broadcast_text = None
-            await update.message.reply_text("ℹ️ Koi user nahi hai jinhe broadcast kiya ja sake.")
+            await update.message.reply_text("ℹ️ There are no users to broadcast to.")
             return
 
         rows = [[
@@ -658,9 +680,9 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel"),
         ]]
         await update.message.reply_text(
-            f"📢 Ye message *{recipient_count} user(s)* ko bhejna hai?\n\n"
+            f"📢 Send this message to *{recipient_count} user(s)*?\n\n"
             f"—\n{text}\n—\n\n"
-            f"⚠️ Ye action undo nahi ho sakta.",
+            f"⚠️ This action cannot be undone.",
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode="Markdown"
         )
@@ -668,7 +690,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     links = re.findall(r'https://drive\.google\.com/\S+', update.message.text or "")
     if not links:
-        await update.message.reply_text("⚠️ Koi valid Google Drive link nahi mila.")
+        await update.message.reply_text("⚠️ No valid Google Drive link found.")
         return
 
     upload_session.extend(links)
@@ -687,9 +709,11 @@ async def broadcast(update, context):
         return
 
     BROADCAST_MODE = True
+
     await update.message.reply_text(
         "📢 Broadcast mode ON.\n\n"
-        "Ab text, photo, video, audio, document, voice, sticker ya animation bhejiye."
+        "Send text, photo, video, audio, document, voice, sticker, or animation.\n\n"
+        "❌ Use /exitbroadcast to turn it off."
     )
 
 
@@ -782,7 +806,7 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     global upload_session, pending_links
     if not upload_session:
-        await update.message.reply_text("❌ Koi link nahi. Pehle /startupload karein.")
+        await update.message.reply_text("❌ No links. Run /startupload first.")
         upload_session = None
         return
 
@@ -790,14 +814,14 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     upload_session = None
 
     await update.message.reply_text(
-        f"📝 {len(pending_links)} links mil gaye.\n\nIs batch ka naam bhejein:"
+        f"📝 Got {len(pending_links)} links.\n\nSend a name for this batch:"
     )
 
 
 async def process_links(links, name, folder_id, update, ctx):
     folder = await db.fetchrow("SELECT id, name, channel_id FROM folders WHERE id = $1", folder_id)
     if not folder or not folder["channel_id"]:
-        await update.message.reply_text("❌ Folder ya channel_id missing — upload cancel hua.")
+        await update.message.reply_text("❌ Folder or channel_id missing — upload cancelled.")
         return
     channel_id = folder["channel_id"]
 
@@ -832,13 +856,13 @@ async def process_links(links, name, folder_id, update, ctx):
         try:
             page_index = await _page_index_for_batch(folder_id, existing["id"])
             await render_folder_page(folder_id, folder["name"], channel_id, page_index, ctx)
-            note = "Channel post update hua."
+            note = "Channel post updated."
         except Exception as e:
             logger.error(f"Channel page render failed for folder {folder_id}: {e}")
-            note = "⚠️ Channel post update nahi ho saka — audios DB mein save ho gaye hain, /folders se channel check karein."
+            note = "⚠️ Channel post could not be updated — audios were saved in the DB, check the channel via /folders."
 
         await update.message.reply_text(
-            f"📥 Batch #{existing['id']} mein {len(to_fill)} audios fill hue (ab total {new_total}).\n{note}"
+            f"📥 Filled {len(to_fill)} audios into Batch #{existing['id']} (now {new_total} total).\n{note}"
         )
 
     chunks = [remaining[i:i + BATCH_MAX] for i in range(0, len(remaining), BATCH_MAX)]
@@ -860,13 +884,13 @@ async def process_links(links, name, folder_id, update, ctx):
         try:
             page_index = await _page_index_for_batch(folder_id, batch_id)
             await render_folder_page(folder_id, folder["name"], channel_id, page_index, ctx)
-            note = f"\"{folder['name']}\" channel par post update ho gaya."
+            note = f"Post updated on \"{folder['name']}\" channel."
         except Exception as e:
             logger.error(f"Channel page render failed for folder {folder_id}: {e}")
-            note = "⚠️ Channel post update nahi ho saka — audios DB mein save ho gaye hain, /folders se channel check karein."
+            note = "⚠️ Channel post could not be updated — audios were saved in the DB, check the channel via /folders."
 
         await update.message.reply_text(
-            f"✅ Batch #{batch_id} \"{chunk_name}\" create hua ({len(chunk)} audios). {note}"
+            f"✅ Batch #{batch_id} \"{chunk_name}\" created ({len(chunk)} audios). {note}"
         )
 
     await update.message.reply_text("🎉 Upload complete!")
@@ -886,12 +910,27 @@ async def _page_index_for_batch(folder_id: int, batch_id: int) -> int:
 
 
 def _page_text(folder_name: str, page_index: int, total_pages: int, total_in_page: int) -> str:
-    display_name = folder_name or "Audio Collection"
-    part_suffix = f" (Part {page_index})" if total_pages > 1 else ""
+    display_name = (folder_name or "Audio Collection").upper()
+
+    part_text = (
+        f"『 ℙ𝕒𝕣𝕥 {page_index} 』"
+        if total_pages > 1
+        else "『 ℂ𝕠𝕞𝕡𝕝𝕖𝕥𝕖 』"
+    )
+
+    total_start = (page_index - 1) * 1000 + 1
+    total_end = min(page_index * 1000, total_pages * 1000)
+
     return (
-        f"🎵 {display_name}{part_suffix}\n"
-        f"📦 Total Audios: {total_in_page}\n"
-        f"👇 Niche button par click karke bot se audio prapt karein."
+        "╔════❖•❄️•❖════╗\n"
+        f"🎧 {display_name}\n"
+        f"{part_text}\n"
+        "╚════❖•❄️•❖════╝\n\n"
+        f"📦 Total Episodes: {total_start} to {total_end}\n"
+        "⚡ Instant Delivery\n"
+        "🎶 Premium Audio Collection\n\n"
+        "👇 Click the button below\n"
+        "to receive your episodes instantly."
     )
 
 
@@ -900,7 +939,7 @@ def _page_buttons(batches_in_page: list, start_offset: int) -> InlineKeyboardMar
     running = start_offset
     for b in batches_in_page:
         end = running + b["total_links"] - 1
-        label = f"{running}-{end}" if b["total_links"] > 1 else str(running)
+        label = f"Ep ❄️ {running} to {end}" if b["total_links"] > 1 else f"Ep ❄️ {running}"
         rows.append([InlineKeyboardButton(label, url=f"https://t.me/{BOT_USERNAME}?start=batch_{b['id']}")])
         running = end + 1
     return InlineKeyboardMarkup(rows)
@@ -976,17 +1015,31 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "👑 *Owner Panel*\n\n"
                 "Commands:\n"
-                "/folders — folders manage karein (create/update channel)\n"
-                "/startupload — links upload karna shuru karein\n"
-                "/done — upload finish karein\n"
-                "/forcejoin — force-join channels/groups manage karein\n\n"
-                "Abhi active session nahi hai.",
+                "/folders — manage folders (create/update channel)\n"
+                "/startupload — start uploading links\n"
+                "/done — finish the upload\n"
+                "/forcejoin — manage force-join channels/groups\n\n"
+                "No active session right now.",
                 parse_mode="Markdown"
             )
             return
 
     if not args or not args[0].startswith("batch_"):
-        await update.message.reply_text("👋 Is bot ko channel ke through use karein.")
+        if OTHER_BOT_URL:
+            await update.message.reply_text(
+                "👋 Use my another bot to schedule message\n"
+                "schedule message, auto approve, QR generator.\n"
+                "any bot related query to use support page\n"
+                "                    ⬇️                ",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🤖 Open Other Bot", url=OTHER_BOT_URL)],
+                        [InlineKeyboardButton("Support Page", url=UPDATE_SUPPORT_GROUP)],
+                    ]
+                )
+            )
+        else:
+            await update.message.reply_text("👋 Please use this bot through the channel.")
         return
 
     batch_id = int(args[0].replace("batch_", ""))
@@ -1002,17 +1055,17 @@ async def _deliver_batch(batch_id: int, chat_id: int, user_id_int: int, ctx: Con
 
     batch = await db.fetchrow("SELECT id, total_links FROM batches WHERE id = $1", batch_id)
     if not batch:
-        await ctx.bot.send_message(chat_id=chat_id, text="❌ Yeh collection exist nahi karta.")
+        await ctx.bot.send_message(chat_id=chat_id, text="❌ This collection does not exist.")
         return
+
+    wait_rows = [[InlineKeyboardButton("• Cancel", callback_data=f"cancelsend_{batch_id}")]]
+    if UPDATE_CHANNEL_URL:
+        wait_rows.append([InlineKeyboardButton("📟 UPDATE CHANNEL", url=UPDATE_CHANNEL_URL)])
 
     warn = await ctx.bot.send_message(
         chat_id=chat_id,
-        text=(
-            f"⚠️ *Warning*\n\n"
-            f"Ye {batch['total_links']} audio files *{DELETE_MINUTES} minute* baad delete ho jayenge.\n\n"
-            f"Abhi forward karein dusri jagah!\n\nBhej rahe hain... 📤"
-        ),
-        parse_mode="Markdown"
+        text="⏳ Please wait...",
+        reply_markup=InlineKeyboardMarkup(wait_rows)
     )
 
     audios = await db.fetch(
@@ -1022,14 +1075,14 @@ async def _deliver_batch(batch_id: int, chat_id: int, user_id_int: int, ctx: Con
     audios = sorted(audios, key=lambda a: a["telegram_file_id"] is None)
 
     has_uncached = any(a["telegram_file_id"] is None for a in audios)
-    sent_ids = [warn.message_id]
+    sent_ids = []
 
     if has_uncached and LIVE_DOWNLOAD_AVAILABLE:
         delay_notice = await ctx.bot.send_message(
             chat_id=chat_id,
             text=(
-                "⏳ Kuch audios pehli baar download ho rahe hain, isme *2 minute tak* lag sakte hain. "
-                "Cached audios turant aa jayenge."
+                "⏳ Some audios are downloading for the first time, this may take *up to 2 minutes*. "
+                "Cached audios will arrive instantly."
             ),
             parse_mode="Markdown"
         )
@@ -1039,8 +1092,15 @@ async def _deliver_batch(batch_id: int, chat_id: int, user_id_int: int, ctx: Con
     uncached_missing = []
     MAX_ATTEMPTS = 3
     RETRY_DELAY = 3
+    cancel_key = (chat_id, batch_id)
+    was_cancelled = False
+    sent_audio_count = 0
 
     for audio in audios:
+        if cancel_key in cancelled_deliveries:
+            was_cancelled = True
+            break
+
         msg = None
         file_bytes = None
         filename = None
@@ -1084,7 +1144,23 @@ async def _deliver_batch(batch_id: int, chat_id: int, user_id_int: int, ctx: Con
                                 await asyncio.sleep(RETRY_DELAY)
                             continue
                     try:
-                        msg = await ctx.bot.send_audio(chat_id=chat_id, audio=file_bytes, filename=filename)
+                        logger.info(
+                            f"Audio {audio['id']} | Size: {len(file_bytes)/1024/1024:.2f} MB"
+                        )
+
+                        start_time = time.time()
+
+                        bio = BytesIO(file_bytes)
+                        bio.name = filename
+
+                        msg = await ctx.bot.send_audio(
+                            chat_id=chat_id,
+                            audio=bio
+                        )
+
+                        logger.info(
+                            f"Audio {audio['id']} uploaded in {time.time() - start_time:.2f} seconds"
+                        )
                     except Exception as e:
                         logger.error(
                             f"Audio {audio['id']} attempt {attempt}/{MAX_ATTEMPTS} "
@@ -1116,35 +1192,63 @@ async def _deliver_batch(batch_id: int, chat_id: int, user_id_int: int, ctx: Con
 
         if msg is not None:
             sent_ids.append(msg.message_id)
+            sent_audio_count += 1
         else:
             failed_audios.append(audio["id"])
             if not LIVE_DOWNLOAD_AVAILABLE and audio["telegram_file_id"] is None:
                 uncached_missing.append(audio["id"])
 
-    if uncached_missing:
-        await ctx.bot.send_message(chat_id=chat_id, text="⚠️ Ye audio abhi available nahi hai.")
+    cancelled_deliveries.discard(cancel_key)
+    try:
+        await ctx.bot.delete_message(chat_id=chat_id, message_id=warn.message_id)
+    except Exception as e:
+        logger.warning(f"Could not remove please-wait message for batch {batch_id}: {e}")
 
-    other_failures = len(failed_audios) - len(uncached_missing)
-    if other_failures > 0:
+    if was_cancelled:
         await ctx.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"⚠️ {other_failures}/{len(audios)} audio bhejne mein fail hue "
-                f"({MAX_ATTEMPTS} attempts ke baad bhi). Phir se /start try karein."
-            )
-        )
-
-    sent_count = len(audios) - len(failed_audios)
-    if sent_count > 0:
-        closing = await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"✅ {sent_count} audio files bhej diye gaye.\n\n"
-                f"⏳ Ye *{DELETE_MINUTES} minute* mein delete ho jayenge — abhi forward kar lein!"
+                f"❌ Cancelled. {sent_audio_count} audio file(s) already sent will still "
+                f"be deleted in *{DELETE_MINUTES} minutes* like normal."
             ),
             parse_mode="Markdown"
         )
-        sent_ids.append(closing.message_id)
+    else:
+        if uncached_missing:
+            await ctx.bot.send_message(chat_id=chat_id, text="⚠️ This audio is not available right now.")
+
+        other_failures = len(failed_audios) - len(uncached_missing)
+        if other_failures > 0:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ Failed to send {other_failures}/{len(audios)} audio files "
+                    f"(even after {MAX_ATTEMPTS} attempts). Please try /start again."
+                )
+            )
+
+        if sent_audio_count > 0:
+            hands = " ".join(["🖐️"] * 8)
+            closing_rows = None
+            if UPDATE_CHANNEL_URL:
+                closing_rows = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📟 UPDATE CHANNEL", url=UPDATE_CHANNEL_URL)]]
+                )
+            closing = await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❤️ HEY BRO ⬇️\n\n"
+                    f"📁 FILES WILL BE DELETED AFTER [{DELETE_MINUTES} minutes] "
+                    f"PLEASE SAVE THEM SOMEWHERE SAFE.\n"
+                    f"TO GET IT AGAIN, REPEAT THE SAME PROCESS.\n\n"
+                    f"{hands}"
+                ),
+                reply_markup=closing_rows
+            )
+            sent_ids.append(closing.message_id)
+
+    if not sent_ids:
+        return
 
     delete_at = datetime.utcnow() + timedelta(minutes=DELETE_MINUTES)
     await db.execute(
@@ -1153,12 +1257,89 @@ async def _deliver_batch(batch_id: int, chat_id: int, user_id_int: int, ctx: Con
     )
 
 
+
+async def cb_cancel_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Marks a batch delivery as cancelled. This is checked once per audio,
+    between sends — it does not abort an upload already in progress, so a
+    file mid-transfer when the user taps Cancel will still land."""
+    batch_id = int(update.callback_query.data.replace("cancelsend_", ""))
+    cancelled_deliveries.add((update.effective_chat.id, batch_id))
+    await update.callback_query.answer("Cancelling after the current file finishes...")
+
+
+async def cmd_refreshbuttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+
+    msg = await update.message.reply_text(
+        "🔄 Refreshing all folder buttons..."
+    )
+
+    folders = await db.fetch(
+        "SELECT id, name, channel_id FROM folders "
+        "WHERE channel_id IS NOT NULL"
+    )
+
+    total_pages = 0
+    updated_pages = 0
+
+    for folder in folders:
+        batches = await db.fetch(
+            "SELECT id FROM batches WHERE folder_id = $1 ORDER BY id",
+            folder["id"]
+        )
+
+        pages = (len(batches) + PAGE_SIZE - 1) // PAGE_SIZE
+        total_pages += pages
+
+        for page in range(1, pages + 1):
+            try:
+                await render_folder_page(
+                    folder["id"],
+                    folder["name"],
+                    folder["channel_id"],
+                    page,
+                    ctx
+                )
+                updated_pages += 1
+
+                # Telegram rate limit se bachne ke liye
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                logger.error(
+                    f"Refresh failed: folder={folder['id']} page={page} error={e}"
+                )
+
+    await msg.edit_text(
+        f"✅ Refresh complete.\n\n"
+        f"Updated: {updated_pages}/{total_pages} pages"
+    )
+
+async def exit_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BROADCAST_MODE
+
+    if update.effective_user.id != OWNER_ID:
+        return
+
+    if not BROADCAST_MODE:
+        await update.message.reply_text(
+            "ℹ️ Broadcast mode is already OFF."
+        )
+        return
+
+    BROADCAST_MODE = False
+
+    await update.message.reply_text(
+        "❌ Broadcast mode turned OFF."
+    )
+
 async def cb_broadcast_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     global pending_broadcast_text
     pending_broadcast_text = None
-    await update.callback_query.edit_message_text("❌ Broadcast cancel ho gaya.")
+    await update.callback_query.edit_message_text("❌ Broadcast cancelled.")
 
 
 async def cb_broadcast_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1169,10 +1350,10 @@ async def cb_broadcast_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pending_broadcast_text = None
 
     if not text:
-        await update.callback_query.edit_message_text("⚠️ Broadcast text mil nahi raha — phir se try karein.")
+        await update.callback_query.edit_message_text("⚠️ Broadcast text not found — please try again.")
         return
 
-    await update.callback_query.edit_message_text("⏳ Broadcast bheja ja raha hai...")
+    await update.callback_query.edit_message_text("⏳ Sending broadcast...")
 
     rows = await db.fetch("SELECT user_id FROM users WHERE user_id != $1", str(OWNER_ID))
     sent, failed, blocked = 0, 0, 0
@@ -1225,14 +1406,16 @@ async def _setup_bot_commands(application: Application):
     users. Owner gets the full admin menu via a chat-scoped command list,
     which overrides the default scope only inside OWNER_ID's own chat."""
     public_commands = [
-        BotCommand("start", "Bot shuru karein"),
+        BotCommand("start", "Start the bot"),
     ]
     owner_commands = public_commands + [
-        BotCommand("folders", "Folders manage karein"),
-        BotCommand("startupload", "Naya batch upload shuru karein"),
-        BotCommand("done", "Current upload batch finish karein"),
-        BotCommand("forcejoin", "Force-join channels manage karein"),
-        BotCommand("broadcast", "broadcast msg fro "),
+        BotCommand("folders", "Manage folders"),
+        BotCommand("startupload", "Start a new batch upload"),
+        BotCommand("done", "Finish the current upload batch"),
+        BotCommand("forcejoin", "Manage force-join channels"),
+        BotCommand("broadcast", "Send a broadcast message"),
+        BotCommand("refreshbuttons", "Refresh all channel buttons"),
+        BotCommand("exitbroadcast", "Exit broadcast mode"),
     ]
 
     try:
@@ -1258,7 +1441,7 @@ async def post_init(application: Application):
     try:
         await application.bot.send_message(
             chat_id=OWNER_ID,
-            text="🔄 Bot restart hua. Agar koi upload session active tha, woh reset ho gaya hai — /startupload se phir shuru karein."
+            text="🔄 Bot restarted. If an upload session was active, it has been reset — start again with /startupload."
         )
     except Exception as e:
         logger.error(f"Restart notice to owner failed: {e}")
@@ -1273,12 +1456,11 @@ def main():
     asyncio.set_event_loop(new_loop)
 
     request = HTTPXRequest(
-        connect_timeout=30.0,
-        read_timeout=120.0,
-        write_timeout=120.0,
-        pool_timeout=30.0,
+        connect_timeout=60.0,
+        read_timeout=300.0,
+        write_timeout=300.0,
+        pool_timeout=60.0,
     )
-
     builder = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1302,6 +1484,8 @@ def main():
     app.add_handler(CommandHandler("folders", cmd_folders))
     app.add_handler(CommandHandler("forcejoin", cmd_forcejoin))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("refreshbuttons", cmd_refreshbuttons))
+    app.add_handler(CommandHandler("exitbroadcast", exit_broadcast))
 
     app.add_handler(CallbackQueryHandler(cb_folder_new, pattern=r"^folder_new$"))
     app.add_handler(CallbackQueryHandler(cb_folder_list, pattern=r"^folder_list$"))
@@ -1313,6 +1497,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_forcejoin_remove, pattern=r"^forcejoin_remove_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_forcejoin_editlink, pattern=r"^forcejoin_editlink_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_checkjoin, pattern=r"^checkjoin_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_send, pattern=r"^cancelsend_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_broadcast_confirm, pattern=r"^broadcast_confirm$"))
     app.add_handler(CallbackQueryHandler(cb_broadcast_cancel, pattern=r"^broadcast_cancel$"))
     
@@ -1321,34 +1506,49 @@ def main():
     		
     app.add_handler(ChatJoinRequestHandler(cb_chat_join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
+
     app.add_handler(
-        MessageHandler(
-            (
-                filters.PHOTO
-                | filters.VIDEO
-                | filters.AUDIO
-                | filters.Document.ALL
-                | filters.VOICE
-                | filters.Sticker.ALL
-                | filters.ANIMATION
-            ),
-            handle_broadcast,
-            block=False,
+            MessageHandler(
+                (
+                    filters.PHOTO
+                    | filters.VIDEO
+                    | filters.AUDIO
+                    | filters.Document.ALL
+                    | filters.VOICE
+                    | filters.Sticker.ALL
+                    | filters.ANIMATION
+                ),
+                handle_broadcast,
+                block=False,
+            )
         )
-    )
+
     app.add_error_handler(on_error)
 
     app.job_queue.run_repeating(auto_delete_job, interval=30, first=10)
 
-    logger.info(f"Starting webhook server on 0.0.0.0:{PORT}, registering {WEBHOOK_URL}")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="webhook",
-        webhook_url=WEBHOOK_URL,
-        secret_token=WEBHOOK_SECRET,
-        allowed_updates=Update.ALL_TYPES,
-    )
+
+    if os.getenv("LOCAL_TEST") == "1":
+        app.run_polling()
+    else:
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook",
+            webhook_url=WEBHOOK_URL,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=Update.ALL_TYPES,
+        )
+
+    # logger.info(f"Starting webhook server on 0.0.0.0:{PORT}, registering {WEBHOOK_URL}")
+    # app.run_webhook(
+    #     listen="0.0.0.0",
+    #     port=PORT,
+    #     url_path="webhook",
+    #     webhook_url=WEBHOOK_URL,
+    #     secret_token=WEBHOOK_SECRET,
+    #     allowed_updates=Update.ALL_TYPES,
+    # )
 
 
 if __name__ == "__main__":
