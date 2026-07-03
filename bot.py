@@ -98,6 +98,10 @@ awaiting_force_join_step: str | None = None   # None | "id" | "link"
 force_join_pending_channel_id: str | None = None
 force_join_pending_title: str | None = None
 
+# Force-join edit flow: waits for a replacement invite link for an
+# already-existing channel_id (set when owner taps "✏️ Edit Link").
+awaiting_force_join_edit_channel_id: str | None = None
+
 # Broadcast flow: owner's fallback text (no other active state) is held here
 # until they confirm via inline button — NOT sent immediately, so a stray
 # typo with no active session can't blast every user.
@@ -108,6 +112,7 @@ def _reset_owner_state():
     global upload_session, pending_links, selected_folder_id
     global awaiting_new_folder_name, awaiting_channel_id_for_folder
     global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
+    global awaiting_force_join_edit_channel_id
     global pending_broadcast_text
     upload_session = None
     pending_links = None
@@ -117,6 +122,7 @@ def _reset_owner_state():
     awaiting_force_join_step = None
     force_join_pending_channel_id = None
     force_join_pending_title = None
+    awaiting_force_join_edit_channel_id = None
     pending_broadcast_text = None
 
 
@@ -292,7 +298,8 @@ async def _show_force_join_management(update: Update, ctx: ContextTypes.DEFAULT_
     channels = await db.fetch("SELECT id, title, channel_id FROM force_join_channels ORDER BY id")
     rows = [
         [
-            InlineKeyboardButton(f"❌ {c['title'] or c['channel_id']}", callback_data=f"forcejoin_remove_{c['id']}")
+            InlineKeyboardButton(f"❌ {c['title'] or c['channel_id']}", callback_data=f"forcejoin_remove_{c['id']}"),
+            InlineKeyboardButton("✏️ Edit Link", callback_data=f"forcejoin_editlink_{c['id']}"),
         ]
         for c in channels
     ]
@@ -336,6 +343,28 @@ async def cb_forcejoin_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     row_id = int(update.callback_query.data.replace("forcejoin_remove_", ""))
     await db.execute("DELETE FROM force_join_channels WHERE id = $1", row_id)
     await _show_force_join_management(update, ctx)
+
+
+async def cb_forcejoin_editlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    _reset_owner_state()
+    global awaiting_force_join_edit_channel_id
+    row_id = int(update.callback_query.data.replace("forcejoin_editlink_", ""))
+    row = await db.fetchrow(
+        "SELECT id, channel_id, title FROM force_join_channels WHERE id = $1", row_id
+    )
+    if not row:
+        await update.callback_query.answer("⚠️ Channel nahi mila (shayad already remove ho chuka hai).", show_alert=True)
+        await _show_force_join_management(update, ctx)
+        return
+    awaiting_force_join_edit_channel_id = row["channel_id"]
+    await update.callback_query.edit_message_text(
+        f"🔗 \"{row['title'] or row['channel_id']}\" ke liye naya invite link bhejein.\n\n"
+        "⚠️ Agar link expire ho raha hai ya 'invalid' dikha raha hai, Telegram mein naya link "
+        "banate waqt expiry date aur member limit dono OFF/blank rakhein — warna ye dobara "
+        "kuch time/uses ke baad invalid ho jayega."
+    )
 
 
 async def cb_chat_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -449,30 +478,12 @@ async def _repost_all_pages_for_folder(folder_id, folder_name, new_channel_id, u
 
 # ── Text message handler ──────────────────────────────────────────────────────
 async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-
-    global upload_session
-    global pending_links
-    global selected_folder_id
-    global awaiting_new_folder_name
-    global awaiting_channel_id_for_folder
-    global awaiting_force_join_step
-    global force_join_pending_channel_id
-    global force_join_pending_title
-    global pending_broadcast_text
-
-    logger.info(
-        f"handle_links: text={update.message.text}, "
-        f"force_step={awaiting_force_join_step}"
-    )
-
-    
-
     if update.effective_user.id != OWNER_ID:
         return
 
     text = (update.message.text or "").strip()
 
-    
+    global awaiting_new_folder_name
     if awaiting_new_folder_name:
         if not text:
             await update.message.reply_text("⚠️ Folder ka naam khali nahi ho sakta.")
@@ -488,7 +499,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        
+        global awaiting_channel_id_for_folder
         awaiting_channel_id_for_folder = folder_id
         await update.message.reply_text(
             f"✅ Folder \"{text}\" ban gaya.\n\n"
@@ -497,7 +508,20 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    
+    global awaiting_force_join_edit_channel_id
+    if awaiting_force_join_edit_channel_id is not None:
+        if not text:
+            await update.message.reply_text("⚠️ Invite link khali nahi ho sakta.")
+            return
+        await db.execute(
+            "UPDATE force_join_channels SET invite_link = $1 WHERE channel_id = $2",
+            text, awaiting_force_join_edit_channel_id
+        )
+        awaiting_force_join_edit_channel_id = None
+        await update.message.reply_text("✅ Invite link update ho gaya.")
+        return
+
+    global awaiting_force_join_step, force_join_pending_channel_id, force_join_pending_title
     if awaiting_force_join_step == "id":
         if not text:
             await update.message.reply_text("⚠️ Channel/Group ID khali nahi ho sakta.")
@@ -602,7 +626,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _repost_all_pages_for_folder(folder_id, folder_row["name"], text, update, ctx)
         return
 
-  
+    global pending_links
     if pending_links is not None:
         if not text:
             await update.message.reply_text("⚠️ Batch ka naam khali nahi ho sakta. Phir se bhejein.")
@@ -618,7 +642,7 @@ async def handle_links(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Broadcast ke liye text message bhejein.")
             return
 
-        
+        global pending_broadcast_text
         pending_broadcast_text = text
         recipient_count = await db.fetchval(
             "SELECT COUNT(*) FROM users WHERE user_id != $1", str(OWNER_ID)
@@ -670,12 +694,7 @@ async def broadcast(update, context):
 
 
 async def handle_broadcast(update, context):
-
     global BROADCAST_MODE
-
-    logger.info(
-        f"handle_broadcast called, mode={BROADCAST_MODE}, text={update.message.text}"
-    )
 
     if not BROADCAST_MODE:
         return
@@ -1292,30 +1311,16 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_forcejoin_list, pattern=r"^forcejoin_list$"))
     app.add_handler(CallbackQueryHandler(cb_forcejoin_add, pattern=r"^forcejoin_add$"))
     app.add_handler(CallbackQueryHandler(cb_forcejoin_remove, pattern=r"^forcejoin_remove_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_forcejoin_editlink, pattern=r"^forcejoin_editlink_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_checkjoin, pattern=r"^checkjoin_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_broadcast_confirm, pattern=r"^broadcast_confirm$"))
     app.add_handler(CallbackQueryHandler(cb_broadcast_cancel, pattern=r"^broadcast_cancel$"))
     
 
-    
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,handle_broadcast,block=False))
     		
     app.add_handler(ChatJoinRequestHandler(cb_chat_join_request))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
-    app.add_handler(
-        MessageHandler(
-            (
-                filters.PHOTO
-                | filters.VIDEO
-                | filters.AUDIO
-                | filters.Document.ALL
-                | filters.VOICE
-                | filters.Sticker.ALL
-                | filters.ANIMATION
-            ),
-            handle_broadcast,
-            block=False,
-        )
-    )
     app.add_error_handler(on_error)
 
     app.job_queue.run_repeating(auto_delete_job, interval=30, first=10)
