@@ -1205,14 +1205,34 @@ async def _deliver_batch(batch_id: int, chat_id: int, user_id_int: int, ctx: Con
         logger.warning(f"Could not remove please-wait message for batch {batch_id}: {e}")
 
     if was_cancelled:
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"❌ Cancelled. {sent_audio_count} audio file(s) already sent will still "
-                f"be deleted in *{DELETE_MINUTES} minutes* like normal."
-            ),
-            parse_mode="Markdown"
-        )
+        if sent_audio_count > 0:
+            hands = " ".join(["🖐️"] * 8)
+
+            closing_rows = None
+            if UPDATE_CHANNEL_URL:
+                closing_rows = InlineKeyboardMarkup(
+                    [[
+                        InlineKeyboardButton(
+                            "📟 UPDATE CHANNEL",
+                            url=UPDATE_CHANNEL_URL
+                        )
+                    ]]
+                )
+
+            closing = await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❤️ HEY BRO ⬇️\n\n"
+                    f"📁 FILES WILL BE DELETED AFTER "
+                    f"[{DELETE_MINUTES} minutes] "
+                    f"PLEASE SAVE THEM SOMEWHERE SAFE.\n"
+                    f"TO GET IT AGAIN, REPEAT THE SAME PROCESS.\n\n"
+                    f"{hands}"
+                ),
+                reply_markup=closing_rows
+            )
+
+            sent_ids.append(closing.message_id)
     else:
         if uncached_missing:
             await ctx.bot.send_message(chat_id=chat_id, text="⚠️ This audio is not available right now.")
@@ -1460,12 +1480,24 @@ def main():
         read_timeout=300.0,
         write_timeout=300.0,
         pool_timeout=60.0,
+        # Default is 1 (python-telegram-bot 21.6). With concurrent_updates(8)
+        # below, a pool of 1 means every outbound call — send_audio for one
+        # user, send_message for another — serializes on a single HTTP
+        # connection, so users end up waiting on each other's uploads even
+        # though the handlers themselves run concurrently. Match this to (or
+        # exceed) concurrent_updates so outbound calls can actually overlap.
+        connection_pool_size=12,
     )
     builder = (
         Application.builder()
         .token(BOT_TOKEN)
         .request(request)
         .post_init(post_init)
+        # Without this, PTB processes updates one at a time, globally — every
+        # user is queued behind whoever's _deliver_batch is currently running,
+        # and the Cancel button can't even be dequeued until delivery finishes.
+        # Bounded (not True/unbounded) to stay under db.py's pool max_size=10.
+        .concurrent_updates(8)
     )
 
     # TELEGRAM_API_BASE_URL sirf tab set karo jab Render outbound block kare.
@@ -1497,7 +1529,9 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_forcejoin_remove, pattern=r"^forcejoin_remove_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_forcejoin_editlink, pattern=r"^forcejoin_editlink_\d+$"))
     app.add_handler(CallbackQueryHandler(cb_checkjoin, pattern=r"^checkjoin_\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_cancel_send, pattern=r"^cancelsend_\d+$"))
+    # block=False: cancel must be dequeued and handled immediately, not queued
+    # behind other work even when concurrent_updates' worker slots are full.
+    app.add_handler(CallbackQueryHandler(cb_cancel_send, pattern=r"^cancelsend_\d+$", block=False))
     app.add_handler(CallbackQueryHandler(cb_broadcast_confirm, pattern=r"^broadcast_confirm$"))
     app.add_handler(CallbackQueryHandler(cb_broadcast_cancel, pattern=r"^broadcast_cancel$"))
     
