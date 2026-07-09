@@ -1036,8 +1036,6 @@ async def render_folder_page(folder_id: int, folder_name: str, channel_id: str, 
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
-import time
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     t0 = time.perf_counter()
@@ -1064,7 +1062,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
     
     if not args or not args[0].startswith("batch_"):
-
+        
+        t1 = time.perf_counter()
         if not await _check_force_join(update, ctx, None):
             logger.info("Force Join: %.2f", time.perf_counter() - t1)
             logger.info("Total: %.2f", time.perf_counter() - t0)
