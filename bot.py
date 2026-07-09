@@ -231,7 +231,14 @@ async def _has_join_request(channel_id: str, user_id: int) -> bool:
 
 async def _is_member(bot, channel_id: str, user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+        start = time.perf_counter()
+        
+        member = await bot.get_chat_member(
+            chat_id=channel_id,
+            user_id=user_id
+        )
+        
+        print(channel_id, time.perf_counter() - start)
         if member.status not in ("left", "kicked"):
             return True
     except Exception as e:
@@ -263,10 +270,19 @@ async def _check_force_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE, batc
     )
     if not channels:
         return True
-
-    not_joined = [c for c in channels if not await _is_member(ctx.bot, c["channel_id"], user.id)]
-    if not not_joined:
-        return True
+        
+    results = await asyncio.gather(
+        *[
+            _is_member(ctx.bot, c["channel_id"], user.id)
+            for c in channels
+        ]
+    )
+    
+    not_joined = [
+        channel
+        for channel, joined in zip(channels, results)
+        if not joined
+    ]
 
     rows = [
         [InlineKeyboardButton(f"🔗 Join Channel {i}", url=c["invite_link"])]
