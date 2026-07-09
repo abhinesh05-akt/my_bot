@@ -25,9 +25,8 @@ class Database:
         self.pool = await asyncpg.create_pool(
             self.url,
             ssl=ssl_context,
-            min_size=1,
-            max_size=10,
-            statement_cache_size=0,
+            min_size=5,
+            max_size=20,
         )
 
     async def disconnect(self):
