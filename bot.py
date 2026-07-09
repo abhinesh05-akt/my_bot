@@ -263,6 +263,19 @@ async def _check_force_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE, batc
         return True
 
     t = time.perf_counter()
+
+    channels = await db.fetch(
+        """
+        SELECT id, channel_id, invite_link, title
+        FROM force_join_channels
+        ORDER BY id
+        """
+    )
+    
+    if not channels:
+        return True
+    
+    # 2. User ki join requests ek hi query me lao
     rows = await db.fetch(
         """
         SELECT channel_id
@@ -294,6 +307,10 @@ async def _check_force_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE, batc
         for c, ok in zip(channels, results)
         if not ok
     ]
+
+    if not not_joined:
+        return True
+    
     rows = [
         [InlineKeyboardButton(f"🔗 Join Channel {i}", url=c["invite_link"])]
         for i, c in enumerate(not_joined, start=1)
