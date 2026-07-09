@@ -307,8 +307,21 @@ async def cb_checkjoin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if batch_id is not None:
         await _deliver_batch(batch_id, update.effective_chat.id, update.effective_user.id, ctx)
     else:
-        await update.callback_query.message.reply_text("✅ Verified. Send /start again.")
-
+        await update.callback_query.answer("✅ Verified!")
+    
+        if OTHER_BOT_URL:
+            await update.callback_query.message.reply_text(
+                "👋 Use my another bot to schedule message\n"
+                "schedule message, auto approve, QR generator.\n"
+                "any bot related query to use support page\n"
+                "⬇️",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🤖 Open Other Bot", url=OTHER_BOT_URL)],
+                        [InlineKeyboardButton("Support Page", url=UPDATE_SUPPORT_GROUP)],
+                    ]
+                ),
+            )
 
 async def cmd_forcejoin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -1023,7 +1036,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
-
+    
+    if not await _check_force_join(update, ctx, None):
+        return
     if not args or not args[0].startswith("batch_"):
         if OTHER_BOT_URL:
             await update.message.reply_text(
