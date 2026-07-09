@@ -222,9 +222,17 @@ async def cb_folder_setchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Force-join ────────────────────────────────────────────────────────────────
 async def _has_join_request(channel_id: str, user_id: int) -> bool:
+    t = time.perf_counter()
+    
     row = await db.fetchrow(
-        "SELECT 1 FROM join_requests WHERE channel_id = $1 AND user_id = $2",
-        channel_id, str(user_id)
+        "SELECT 1 FROM join_requests WHERE channel_id=$1 AND user_id=$2",
+        channel_id,
+        str(user_id)
+    )
+    
+    logger.info(
+        "Join request query: %.2f",
+        time.perf_counter() - t
     )
     return row is not None
 
@@ -271,9 +279,11 @@ async def _check_force_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE, batc
     if user.id == OWNER_ID:
         return True
 
+    t = time.perf_counter()
     channels = await db.fetch(
         "SELECT id, channel_id, invite_link, title FROM force_join_channels ORDER BY id"
     )
+    logger.info("Fetch channels: %.2f", time.perf_counter() - t)
     if not channels:
         return True
         
