@@ -1036,14 +1036,18 @@ async def render_folder_page(folder_id: int, folder_name: str, channel_id: str, 
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
+import time
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
+    t0 = time.perf_counter()
 
     await db.execute(
         """INSERT INTO users (user_id) VALUES ($1)
            ON CONFLICT (user_id) DO UPDATE SET last_seen = NOW()""",
         str(update.effective_user.id)
     )
+    logger.info("DB: %.2f", time.perf_counter() - t0)
 
     if update.effective_user.id == OWNER_ID:
         if not args or not args[0].startswith("batch_"):
@@ -1062,8 +1066,15 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not args or not args[0].startswith("batch_"):
 
         if not await _check_force_join(update, ctx, None):
+            logger.info("Force Join: %.2f", time.perf_counter() - t1)
+            logger.info("Total: %.2f", time.perf_counter() - t0)
             return
+    
+        logger.info("Force Join: %.2f", time.perf_counter() - t1)
+
+
         if OTHER_BOT_URL:
+            t2 = time.perf_counter()
             await update.message.reply_text(
                 "👋 Use my another bot to schedule message\n"
                 "schedule message, auto approve, QR generator.\n"
@@ -1076,6 +1087,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     ]
                 )
             )
+            logger.info("Reply: %.2f", time.perf_counter() - t2)
+            logger.info("Total: %.2f", time.perf_counter() - t0)
         else:
             await update.message.reply_text("👋 Please use this bot through the channel.")
         return
