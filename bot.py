@@ -231,6 +231,8 @@ async def _has_join_request(channel_id: str, user_id: int) -> bool:
 
 async def _is_member(bot, channel_id: str, user_id: int) -> bool:
     try:
+        logger = logging.getLogger(__name__)
+        
         start = time.perf_counter()
         
         member = await bot.get_chat_member(
@@ -238,7 +240,11 @@ async def _is_member(bot, channel_id: str, user_id: int) -> bool:
             user_id=user_id
         )
         
-        print(channel_id, time.perf_counter() - start)
+        logger.info(
+            "Channel %s checked in %.2f sec",
+            channel_id,
+            time.perf_counter() - start
+        )
         if member.status not in ("left", "kicked"):
             return True
     except Exception as e:
@@ -1053,9 +1059,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
     
-    if not await _check_force_join(update, ctx, None):
-        return
     if not args or not args[0].startswith("batch_"):
+
+        if not await _check_force_join(update, ctx, None):
+            return
         if OTHER_BOT_URL:
             await update.message.reply_text(
                 "👋 Use my another bot to schedule message\n"
