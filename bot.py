@@ -221,23 +221,7 @@ async def cb_folder_setchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Force-join ────────────────────────────────────────────────────────────────
-async def _has_join_request(channel_id: str, user_id: int) -> bool:
-    t = time.perf_counter()
-    
-    row = await db.fetchrow(
-        "SELECT 1 FROM join_requests WHERE channel_id=$1 AND user_id=$2",
-        channel_id,
-        str(user_id)
-    )
-    
-    logger.info(
-        "Join request query: %.2f",
-        time.perf_counter() - t
-    )
-    return row is not None
-
-
-async def _is_member(bot, channel_id: str, user_id: int) -> bool:
+async def _is_member(bot, channel_id: str, user_id: int, requested: set) -> bool:
     try:
         logger = logging.getLogger(__name__)
         
@@ -268,8 +252,7 @@ async def _is_member(bot, channel_id: str, user_id: int) -> bool:
     # to pass the gate. NOTE: this means the gate can be satisfied just by
     # clicking "Request to Join" without ever actually being let into the
     # channel — weaker than a real membership check, by design per request.
-    return await _has_join_request(channel_id, user_id)
-
+    return channel_id in requested
 
 async def _check_force_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE, batch_id: int | None) -> bool:
     """Returns True if the user may proceed. Otherwise sends a join prompt
@@ -280,26 +263,37 @@ async def _check_force_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE, batc
         return True
 
     t = time.perf_counter()
-    channels = await db.fetch(
-        "SELECT id, channel_id, invite_link, title FROM force_join_channels ORDER BY id"
+    rows = await db.fetch(
+        """
+        SELECT channel_id
+        FROM join_requests
+        WHERE user_id = $1
+        """,
+        str(user.id)
     )
+    
+    requested = {r["channel_id"] for r in rows}
     logger.info("Fetch channels: %.2f", time.perf_counter() - t)
     if not channels:
         return True
         
     results = await asyncio.gather(
         *[
-            _is_member(ctx.bot, c["channel_id"], user.id)
+            _is_member(
+                ctx.bot,
+                c["channel_id"],
+                user.id,
+                requested
+            )
             for c in channels
         ]
     )
     
     not_joined = [
-        channel
-        for channel, joined in zip(channels, results)
-        if not joined
+        c
+        for c, ok in zip(channels, results)
+        if not ok
     ]
-
     rows = [
         [InlineKeyboardButton(f"🔗 Join Channel {i}", url=c["invite_link"])]
         for i, c in enumerate(not_joined, start=1)
